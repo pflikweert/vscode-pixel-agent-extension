@@ -6,7 +6,10 @@ const MAX_QUEUED_MESSAGES = 120;
 const EVENT_THROTTLE_MS = 350;
 const IDLE_TIMEOUT_MS = 8000;
 const DEV_SERVER_TIMEOUT_MS = 1200;
+const PANEL_READY_TIMEOUT_MS = 2500;
 const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
+const MAX_COMMAND_PREVIEW_LENGTH = 120;
+const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = true;
 
 type AgentId = 'scout' | 'builder' | 'reviewer';
 type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
@@ -60,6 +63,7 @@ let panelRef: vscode.WebviewPanel | undefined;
 let panelReady = false;
 let queuedMessages: ExtensionToWebviewMessage[] = [];
 let preferredPanelMode: PanelMode = 'auto';
+let panelReadyWatchdog: NodeJS.Timeout | undefined;
 let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
 const lastDocumentChangeEventAt = new Map<string, number>();
@@ -383,6 +387,91 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     scheduleAgentIdle('scout', 4500);
   });
 
+  const terminalOpenListener = vscode.window.onDidOpenTerminal((terminal) => {
+    emitRuntimeEvent({
+      type: 'terminal.opened',
+      timestamp: Date.now(),
+      summary: 'Terminal geopend',
+      detail: terminal.name,
+      agentId: 'scout',
+      status: 'working',
+      progress: 20
+    });
+    scheduleAgentIdle('scout', 5000);
+  });
+
+  const terminalCloseListener = vscode.window.onDidCloseTerminal((terminal) => {
+    emitRuntimeEvent({
+      type: 'terminal.closed',
+      timestamp: Date.now(),
+      summary: 'Terminal gesloten',
+      detail: terminal.name,
+      agentId: 'scout',
+      status: 'completed',
+      progress: 100
+    });
+    scheduleAgentIdle('scout', 4500);
+  });
+
+  const supportsShellExecStart = typeof (vscode.window as unknown as {
+    onDidStartTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionStartEvent>;
+  }).onDidStartTerminalShellExecution === 'function';
+
+  const supportsShellExecEnd = typeof (vscode.window as unknown as {
+    onDidEndTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionEndEvent>;
+  }).onDidEndTerminalShellExecution === 'function';
+
+  const terminalCommandStartListener = supportsShellExecStart
+    ? vscode.window.onDidStartTerminalShellExecution((event) => {
+        const command = sanitizeCommandPreview(event.execution.commandLine.value || '');
+        const terminalName = event.terminal.name || 'terminal';
+        const agentId = inferAgentForCommandLine(command);
+
+        emitRuntimeEvent({
+          type: 'terminal.commandStarted',
+          timestamp: Date.now(),
+          summary: 'Terminal commando gestart',
+          detail: `${terminalName}: ${command}`,
+          agentId,
+          status: 'working',
+          progress: 65
+        });
+        scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
+      })
+    : undefined;
+
+  const terminalCommandEndListener = supportsShellExecEnd
+    ? vscode.window.onDidEndTerminalShellExecution((event) => {
+        const command = sanitizeCommandPreview(event.execution.commandLine.value || '');
+        const terminalName = event.terminal.name || 'terminal';
+        const exitCode = event.exitCode;
+
+        const status: AgentStatus = exitCode === undefined ? 'completed' : exitCode === 0 ? 'completed' : 'error';
+        const summary =
+          exitCode === undefined
+            ? 'Terminal commando afgerond'
+            : exitCode === 0
+              ? 'Terminal commando succesvol'
+              : 'Terminal commando gefaald';
+        const detail =
+          exitCode === undefined
+            ? `${terminalName}: ${command} (exit onbekend)`
+            : `${terminalName}: ${command} (exit ${exitCode})`;
+
+        const agentId = inferAgentForCommandLine(command);
+        emitRuntimeEvent({
+          type: 'terminal.commandFinished',
+          timestamp: Date.now(),
+          summary,
+          detail,
+          agentId,
+          status,
+          progress: 100
+        });
+        scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
+      })
+    : undefined;
+
   context.subscriptions.push(
     changeListener,
     saveListener,
@@ -392,8 +481,17 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     diagnosticsListener,
     taskStartListener,
     taskEndListener,
-    editorListener
+    editorListener,
+    terminalOpenListener,
+    terminalCloseListener
   );
+
+  if (terminalCommandStartListener) {
+    context.subscriptions.push(terminalCommandStartListener);
+  }
+  if (terminalCommandEndListener) {
+    context.subscriptions.push(terminalCommandEndListener);
+  }
 }
 
 function getWorkspaceSummary(): string {
@@ -494,6 +592,30 @@ function inferAgentForTask(taskName: string): AgentId {
     return 'builder';
   }
   return 'scout';
+}
+
+function inferAgentForCommandLine(commandLine: string): AgentId {
+  const lower = commandLine.toLowerCase();
+  if (/lint|eslint|test|review|diagnostic|check/.test(lower)) {
+    return 'reviewer';
+  }
+  if (/build|compile|vite|npm run|pnpm|yarn|tsc|bundle/.test(lower)) {
+    return 'builder';
+  }
+  return 'scout';
+}
+
+function sanitizeCommandPreview(commandLine: string): string {
+  if (!commandLine) {
+    return '(leeg commando)';
+  }
+
+  const redacted = commandLine.replace(
+    /\b(password|passwd|pwd|token|secret|api[_-]?key)\s*=\s*([^\s]+)/gi,
+    '$1=***'
+  );
+
+  return shorten(redacted.replace(/\s+/g, ' ').trim(), MAX_COMMAND_PREVIEW_LENGTH);
 }
 
 function createInitialRuntimeState(): RuntimeState {
@@ -620,6 +742,13 @@ function shorten(value: string, maxLength: number): string {
 function openPixelPanel(context: vscode.ExtensionContext) {
   if (panelRef) {
     panelRef.reveal(vscode.ViewColumn.Beside);
+
+    if (!panelReady) {
+      preferredPanelMode = 'embedded';
+      void renderPanelHtml(panelRef, context);
+      armPanelReadyWatchdog(context);
+    }
+
     postSnapshot();
     emitRuntimeEvent({
       type: 'panel.revealed',
@@ -645,12 +774,14 @@ function openPixelPanel(context: vscode.ExtensionContext) {
   panelReady = false;
   panelRef.iconPath = new vscode.ThemeIcon('symbol-color');
   void renderPanelHtml(panelRef, context);
+  armPanelReadyWatchdog(context);
 
   panelRef.onDidDispose(() => {
     panelRef = undefined;
     panelReady = false;
     preferredPanelMode = 'auto';
     queuedMessages = [];
+    clearPanelReadyWatchdog();
   });
 
   panelRef.webview.onDidReceiveMessage(async (message: WebviewToExtensionMessage) => {
@@ -660,6 +791,7 @@ function openPixelPanel(context: vscode.ExtensionContext) {
 
     if (message.type === 'webview-ready') {
       panelReady = true;
+      clearPanelReadyWatchdog();
       postSnapshot();
       flushQueuedMessages();
       emitRuntimeEvent({
@@ -680,6 +812,7 @@ function openPixelPanel(context: vscode.ExtensionContext) {
       preferredPanelMode = 'auto';
       if (panelRef) {
         await renderPanelHtml(panelRef, context);
+        armPanelReadyWatchdog(context);
       }
       return;
     }
@@ -688,6 +821,7 @@ function openPixelPanel(context: vscode.ExtensionContext) {
       preferredPanelMode = 'production';
       if (panelRef) {
         await renderPanelHtml(panelRef, context);
+        armPanelReadyWatchdog(context);
       }
       return;
     }
@@ -696,6 +830,7 @@ function openPixelPanel(context: vscode.ExtensionContext) {
       preferredPanelMode = 'embedded';
       if (panelRef) {
         await renderPanelHtml(panelRef, context);
+        armPanelReadyWatchdog(context);
       }
     }
   });
@@ -710,6 +845,7 @@ function openPixelPanel(context: vscode.ExtensionContext) {
 
 async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<void> {
   panelReady = false;
+  clearPanelReadyWatchdog();
 
   const devServerUrl = process.env.PIXEL_AGENT_WEBVIEW_DEV_SERVER_URL || DEFAULT_DEV_SERVER_URL;
   const inDevMode = context.extensionMode === vscode.ExtensionMode.Development;
@@ -737,12 +873,48 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
 
   const probe = await probeDevServer(devServerUrl);
   if (probe.ok) {
+    if (AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED) {
+      panel.webview.html = getWebviewHtml(panel.webview);
+      return;
+    }
+
     panel.webview.html = getDevWebviewHtml(panel.webview, devServerUrl);
     return;
   }
 
   const hasBundle = await hasProductionBundle(context.extensionUri);
   panel.webview.html = getDevServerFallbackHtml(panel.webview, devServerUrl, probe.reason, hasBundle);
+}
+
+function clearPanelReadyWatchdog() {
+  if (panelReadyWatchdog) {
+    clearTimeout(panelReadyWatchdog);
+    panelReadyWatchdog = undefined;
+  }
+}
+
+function armPanelReadyWatchdog(context: vscode.ExtensionContext) {
+  clearPanelReadyWatchdog();
+
+  panelReadyWatchdog = setTimeout(() => {
+    if (!panelRef || panelReady) {
+      return;
+    }
+
+    preferredPanelMode = 'embedded';
+    const panel = panelRef;
+    void renderPanelHtml(panel, context).then(() => {
+      emitRuntimeEvent({
+        type: 'panel.recovery',
+        timestamp: Date.now(),
+        summary: 'Panel recovery uitgevoerd',
+        detail: 'Geen webview-ready signaal ontvangen, embedded UI opnieuw geladen.',
+        agentId: 'builder',
+        status: 'working',
+        progress: 55
+      });
+    });
+  }, PANEL_READY_TIMEOUT_MS);
 }
 
 async function probeDevServer(devServerUrl: string): Promise<{ ok: boolean; reason: string }> {
@@ -791,6 +963,7 @@ async function hasProductionBundle(extensionUri: vscode.Uri): Promise<boolean> {
 function getDevWebviewHtml(webview: vscode.Webview, devServerUrl: string): string {
   const normalizedUrl = devServerUrl.replace(/\/$/, '');
   const wsOrigin = toWebSocketOrigin(normalizedUrl);
+  const nonce = getNonce();
 
   return `<!doctype html>
 <html lang="en">
@@ -799,12 +972,164 @@ function getDevWebviewHtml(webview: vscode.Webview, devServerUrl: string): strin
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline' ${normalizedUrl}; script-src 'unsafe-eval' ${normalizedUrl}; connect-src ${normalizedUrl} ${wsOrigin}; font-src ${webview.cspSource} ${normalizedUrl};"
+      content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline' ${normalizedUrl}; script-src 'unsafe-eval' 'nonce-${nonce}' ${webview.cspSource} ${normalizedUrl}; connect-src ${normalizedUrl} ${wsOrigin}; font-src ${webview.cspSource} ${normalizedUrl};"
     />
     <title>Pixel Agent</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f1420;
+        --card: #182236;
+        --line: #30445e;
+        --text: #e7f0ff;
+        --muted: #9eb4d1;
+        --accent: #7fe2bf;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: radial-gradient(circle at 18% 18%, rgba(91, 141, 196, 0.24), transparent 40%), var(--bg);
+        color: var(--text);
+        font-family: 'Avenir Next', 'Segoe UI', sans-serif;
+      }
+      #boot-shell {
+        max-width: 760px;
+        margin: 24px auto;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: linear-gradient(165deg, rgba(24, 34, 54, 0.95), rgba(12, 18, 30, 0.96));
+        padding: 18px;
+      }
+      #boot-shell h1 {
+        margin: 0 0 8px;
+        font-size: 21px;
+      }
+      #boot-shell p {
+        margin: 0 0 8px;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      #boot-shell code {
+        display: block;
+        margin-top: 6px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(8, 13, 22, 0.85);
+        color: var(--text);
+        padding: 8px 10px;
+        word-break: break-word;
+      }
+      .actions {
+        margin-top: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      button {
+        border: 0;
+        border-radius: 9px;
+        padding: 9px 13px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #061018;
+      }
+      button.secondary {
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--text);
+      }
+    </style>
   </head>
   <body>
+    <main id="boot-shell">
+      <h1>Loading Pixel Agent UI</h1>
+      <p id="boot-status">Connecting to the Vite dev server...</p>
+      <code>${escapeHtml(normalizedUrl)}</code>
+      <div class="actions" id="boot-actions" hidden>
+        <button id="retry" class="primary">Retry Dev Server</button>
+        <button id="load-production" class="secondary">Load Production Bundle</button>
+        <button id="load-embedded" class="secondary">Load Embedded Panel</button>
+      </div>
+    </main>
     <div id="app"></div>
+    <script nonce="${nonce}">
+      const vscodeApi = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : undefined;
+      const appRoot = document.getElementById('app');
+      const bootShell = document.getElementById('boot-shell');
+      const bootStatus = document.getElementById('boot-status');
+      const bootActions = document.getElementById('boot-actions');
+
+      let didFinish = false;
+      let didFail = false;
+
+      function markReadyIfMounted() {
+        if (didFinish || !appRoot) {
+          return;
+        }
+        if (appRoot.childElementCount > 0) {
+          didFinish = true;
+          bootShell?.remove();
+        }
+      }
+
+      function showFailure(reason) {
+        if (didFinish || didFail) {
+          return;
+        }
+        didFail = true;
+        if (bootStatus) {
+          bootStatus.textContent = 'Dev UI failed to boot. ' + (reason || 'Open fallback mode.');
+        }
+        if (bootActions) {
+          bootActions.hidden = false;
+        }
+      }
+
+      window.addEventListener(
+        'error',
+        (event) => {
+          const message = event?.message ? String(event.message) : 'Script error';
+          showFailure(message);
+        },
+        true
+      );
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event?.reason ? String(event.reason) : 'Unhandled promise rejection';
+        showFailure(reason);
+      });
+
+      const mountCheck = setInterval(() => {
+        if (didFinish) {
+          clearInterval(mountCheck);
+          return;
+        }
+        markReadyIfMounted();
+      }, 120);
+
+      setTimeout(() => {
+        markReadyIfMounted();
+        if (!didFinish) {
+          clearInterval(mountCheck);
+          showFailure('Timed out while loading modules from dev server.');
+        }
+      }, 3200);
+
+      document.getElementById('retry')?.addEventListener('click', () => {
+        vscodeApi?.postMessage({ type: 'retry-dev-server' });
+      });
+
+      document.getElementById('load-production')?.addEventListener('click', () => {
+        vscodeApi?.postMessage({ type: 'load-production' });
+      });
+
+      document.getElementById('load-embedded')?.addEventListener('click', () => {
+        vscodeApi?.postMessage({ type: 'load-embedded' });
+      });
+    </script>
     <script type="module" src="${normalizedUrl}/@vite/client"></script>
     <script type="module" src="${normalizedUrl}/src/main.ts"></script>
   </body>

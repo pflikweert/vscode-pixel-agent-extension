@@ -27,15 +27,12 @@
       "problemMatcher": [
         {
           "owner": "custom",
-          "pattern": [
-            {
-              "regexp": "^(ERROR.*)$",
-              "message": 1
-            }
-          ],
+          "pattern": {
+            "regexp": "$^"
+          },
           "background": {
             "activeOnStart": true,
-            "beginsPattern": ".",
+            "beginsPattern": ".*",
             "endsPattern": "ready in|Local:"
           }
         }

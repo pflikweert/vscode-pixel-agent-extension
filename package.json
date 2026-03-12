@@ -1,0 +1,54 @@
+{
+  "name": "pixel-copilot-agent",
+  "displayName": "Pixel Copilot Agent",
+  "description": "A starter extension with a pixel-style agent panel and Copilot Chat participant.",
+  "version": "0.0.1",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:pixelAgent.openPanel",
+    "onChatParticipant:pixel-copilot-agent.pixel"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pixelAgent.openPanel",
+        "title": "Pixel Agent: Open Panel"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "pixel-copilot-agent.pixel",
+        "name": "pixel",
+        "fullName": "Pixel Agent",
+        "description": "A playful coding sidekick that can reason over your workspace and show visual state.",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "show",
+            "description": "Open the pixel visualizer panel"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "eslint": "^9.3.0",
+    "typescript": "^5.4.5"
+  }
+}

@@ -5,6 +5,8 @@ const MAX_EVENT_LOG = 30;
 const MAX_QUEUED_MESSAGES = 120;
 const EVENT_THROTTLE_MS = 350;
 const IDLE_TIMEOUT_MS = 8000;
+const DEV_SERVER_TIMEOUT_MS = 1200;
+const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
 
 type AgentId = 'scout' | 'builder' | 'reviewer';
 type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
@@ -41,7 +43,12 @@ type ExtensionToWebviewMessage =
 
 type WebviewToExtensionMessage =
   | { type: 'webview-ready' }
-  | { type: 'webview-request-snapshot' };
+  | { type: 'webview-request-snapshot' }
+  | { type: 'retry-dev-server' }
+  | { type: 'load-production' }
+  | { type: 'load-embedded' };
+
+type PanelMode = 'auto' | 'production' | 'embedded';
 
 const AGENT_LABELS: Record<AgentId, string> = {
   scout: 'Scout',
@@ -52,6 +59,7 @@ const AGENT_LABELS: Record<AgentId, string> = {
 let panelRef: vscode.WebviewPanel | undefined;
 let panelReady = false;
 let queuedMessages: ExtensionToWebviewMessage[] = [];
+let preferredPanelMode: PanelMode = 'auto';
 let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
 const lastDocumentChangeEventAt = new Map<string, number>();
@@ -628,21 +636,24 @@ function openPixelPanel(context: vscode.ExtensionContext) {
     vscode.ViewColumn.Beside,
     {
       enableScripts: true,
-      retainContextWhenHidden: true
+      retainContextWhenHidden: true,
+      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview')]
     }
   );
 
+  preferredPanelMode = 'auto';
   panelReady = false;
   panelRef.iconPath = new vscode.ThemeIcon('symbol-color');
-  panelRef.webview.html = getWebviewHtml(panelRef.webview);
+  void renderPanelHtml(panelRef, context);
 
   panelRef.onDidDispose(() => {
     panelRef = undefined;
     panelReady = false;
+    preferredPanelMode = 'auto';
     queuedMessages = [];
   });
 
-  panelRef.webview.onDidReceiveMessage((message: WebviewToExtensionMessage) => {
+  panelRef.webview.onDidReceiveMessage(async (message: WebviewToExtensionMessage) => {
     if (!message || typeof message.type !== 'string') {
       return;
     }
@@ -662,6 +673,30 @@ function openPixelPanel(context: vscode.ExtensionContext) {
 
     if (message.type === 'webview-request-snapshot') {
       postSnapshot();
+      return;
+    }
+
+    if (message.type === 'retry-dev-server') {
+      preferredPanelMode = 'auto';
+      if (panelRef) {
+        await renderPanelHtml(panelRef, context);
+      }
+      return;
+    }
+
+    if (message.type === 'load-production') {
+      preferredPanelMode = 'production';
+      if (panelRef) {
+        await renderPanelHtml(panelRef, context);
+      }
+      return;
+    }
+
+    if (message.type === 'load-embedded') {
+      preferredPanelMode = 'embedded';
+      if (panelRef) {
+        await renderPanelHtml(panelRef, context);
+      }
     }
   });
 
@@ -671,6 +706,272 @@ function openPixelPanel(context: vscode.ExtensionContext) {
     summary: 'Pixel panel geopend',
     detail: 'Wachten op webview connectie.'
   });
+}
+
+async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<void> {
+  panelReady = false;
+
+  const devServerUrl = process.env.PIXEL_AGENT_WEBVIEW_DEV_SERVER_URL || DEFAULT_DEV_SERVER_URL;
+  const inDevMode = context.extensionMode === vscode.ExtensionMode.Development;
+
+  if (preferredPanelMode === 'embedded') {
+    panel.webview.html = getWebviewHtml(panel.webview);
+    return;
+  }
+
+  if (preferredPanelMode === 'production') {
+    const hasBundle = await hasProductionBundle(context.extensionUri);
+    panel.webview.html = hasBundle
+      ? getProdWebviewHtml(panel.webview, context.extensionUri)
+      : getBundleMissingHtml(panel.webview, devServerUrl, 'Production bundle not found.');
+    return;
+  }
+
+  if (!inDevMode) {
+    const hasBundle = await hasProductionBundle(context.extensionUri);
+    panel.webview.html = hasBundle
+      ? getProdWebviewHtml(panel.webview, context.extensionUri)
+      : getBundleMissingHtml(panel.webview, devServerUrl, 'Run npm run build in this repository.');
+    return;
+  }
+
+  const probe = await probeDevServer(devServerUrl);
+  if (probe.ok) {
+    panel.webview.html = getDevWebviewHtml(panel.webview, devServerUrl);
+    return;
+  }
+
+  const hasBundle = await hasProductionBundle(context.extensionUri);
+  panel.webview.html = getDevServerFallbackHtml(panel.webview, devServerUrl, probe.reason, hasBundle);
+}
+
+async function probeDevServer(devServerUrl: string): Promise<{ ok: boolean; reason: string }> {
+  const normalizedUrl = devServerUrl.replace(/\/$/, '');
+  const clientUrl = `${normalizedUrl}/@vite/client`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, DEV_SERVER_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(clientUrl, {
+      method: 'GET',
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return { ok: false, reason: `HTTP ${response.status}` };
+    }
+
+    return { ok: true, reason: '' };
+  } catch (error) {
+    if (error instanceof Error) {
+      return { ok: false, reason: error.message };
+    }
+    return { ok: false, reason: 'Unknown network error' };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function hasProductionBundle(extensionUri: vscode.Uri): Promise<boolean> {
+  const scriptUri = vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'main.js');
+  const styleUri = vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'style.css');
+
+  try {
+    await vscode.workspace.fs.stat(scriptUri);
+    await vscode.workspace.fs.stat(styleUri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getDevWebviewHtml(webview: vscode.Webview, devServerUrl: string): string {
+  const normalizedUrl = devServerUrl.replace(/\/$/, '');
+  const wsOrigin = toWebSocketOrigin(normalizedUrl);
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline' ${normalizedUrl}; script-src 'unsafe-eval' ${normalizedUrl}; connect-src ${normalizedUrl} ${wsOrigin}; font-src ${webview.cspSource} ${normalizedUrl};"
+    />
+    <title>Pixel Agent</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="${normalizedUrl}/@vite/client"></script>
+    <script type="module" src="${normalizedUrl}/src/main.ts"></script>
+  </body>
+</html>`;
+}
+
+function getProdWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+  const scriptUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'main.js')
+  );
+  const styleUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'style.css')
+  );
+  const nonce = getNonce();
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"
+    />
+    <link rel="stylesheet" href="${styleUri}" />
+    <title>Pixel Agent</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script nonce="${nonce}" type="module" src="${scriptUri}"></script>
+  </body>
+</html>`;
+}
+
+function getDevServerFallbackHtml(
+  webview: vscode.Webview,
+  devServerUrl: string,
+  reason: string,
+  productionBundleAvailable: boolean
+): string {
+  const nonce = getNonce();
+  const safeUrl = escapeHtml(devServerUrl);
+  const safeReason = escapeHtml(reason);
+  const productionButton = productionBundleAvailable
+    ? '<button id="load-production" class="secondary">Load Production Bundle</button>'
+    : '';
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';"
+    />
+    <title>Pixel Agent</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0a1626;
+        --bg-card: #13253b;
+        --line: #294666;
+        --text: #ecf4ff;
+        --muted: #96acc8;
+        --accent: #7ad1ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        background: radial-gradient(circle at 20% 20%, #1e466b 0%, transparent 45%), var(--bg);
+        color: var(--text);
+        padding: 24px;
+      }
+      main {
+        width: min(740px, 100%);
+        background: linear-gradient(170deg, rgba(23, 43, 66, 0.96), var(--bg-card));
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 24px;
+      }
+      h1 { margin: 0 0 10px; font-size: 24px; }
+      p { margin: 0 0 10px; color: var(--muted); line-height: 1.45; }
+      code {
+        display: block;
+        margin-top: 6px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(7, 17, 30, 0.75);
+        color: var(--text);
+        word-break: break-word;
+      }
+      .actions {
+        margin-top: 16px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button.primary { background: var(--accent); color: #05111d; }
+      button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Webview dev server is offline</h1>
+      <p>Pixel Agent tried to load the Vite dev server, but it was unreachable.</p>
+      <p>Expected URL:</p>
+      <code>${safeUrl}</code>
+      <p>Reason:</p>
+      <code>${safeReason || 'Connection failed'}</code>
+      <p>Start it with:</p>
+      <code>npm run dev:webview</code>
+      <div class="actions">
+        <button id="retry" class="primary">Retry Dev Server</button>
+        ${productionButton}
+        <button id="load-embedded" class="secondary">Load Embedded Panel</button>
+      </div>
+    </main>
+    <script nonce="${nonce}">
+      const vscode = acquireVsCodeApi();
+      document.getElementById('retry')?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'retry-dev-server' });
+      });
+      document.getElementById('load-production')?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'load-production' });
+      });
+      document.getElementById('load-embedded')?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'load-embedded' });
+      });
+    </script>
+  </body>
+</html>`;
+}
+
+function getBundleMissingHtml(webview: vscode.Webview, devServerUrl: string, reason: string): string {
+  return getDevServerFallbackHtml(webview, devServerUrl, reason, false);
+}
+
+function toWebSocketOrigin(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const wsProtocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${wsProtocol}//${parsed.host}`;
+  } catch {
+    return 'ws://127.0.0.1:5173';
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 function queueOrSendMessage(message: ExtensionToWebviewMessage) {

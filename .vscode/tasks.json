@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev: extension + webview",
+      "dependsOn": [
+        "npm: watch",
+        "npm: dev:webview"
+      ],
+      "dependsOrder": "parallel"
+    },
+    {
+      "type": "npm",
+      "script": "watch",
+      "label": "npm: watch",
+      "isBackground": true,
+      "problemMatcher": [
+        "$tsc-watch"
+      ],
+      "group": "build"
+    },
+    {
+      "type": "npm",
+      "script": "dev:webview",
+      "label": "npm: dev:webview",
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "custom",
+          "pattern": [
+            {
+              "regexp": "^(ERROR.*)$",
+              "message": 1
+            }
+          ],
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": ".",
+            "endsPattern": "ready in|Local:"
+          }
+        }
+      ],
+      "group": "build"
+    },
+    {
+      "type": "npm",
+      "script": "build",
+      "label": "npm: build",
+      "problemMatcher": [
+        "$tsc"
+      ],
+      "group": "build"
+    }
+  ]
+}

@@ -13,7 +13,6 @@
   ],
   "activationEvents": [
     "onStartupFinished",
-    "onCommand:pixelAgent.openPanel",
     "onChatParticipant:pixel-copilot-agent.pixel"
   ],
   "main": "./dist/extension.js",
@@ -41,14 +40,23 @@
     ]
   },
   "scripts": {
-    "build": "tsc -p ./",
-    "watch": "tsc -w -p ./",
-    "lint": "eslint src --ext ts"
+    "build": "npm run build:extension && npm run build:webview",
+    "build:extension": "tsc -p ./",
+    "build:webview": "vite build --config webview-ui/vite.config.ts",
+    "watch": "npm run watch:extension",
+    "watch:extension": "tsc -w -p ./ --preserveWatchOutput",
+    "dev:webview": "vite --config webview-ui/vite.config.ts",
+    "lint": "eslint \"src/**/*.ts\" \"webview-ui/src/**/*.ts\""
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^20.12.12",
     "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^8.57.0",
+    "@typescript-eslint/parser": "^8.57.0",
     "eslint": "^9.3.0",
-    "typescript": "^5.4.5"
+    "globals": "^17.4.0",
+    "typescript": "^5.4.5",
+    "vite": "^7.3.1"
   }
 }

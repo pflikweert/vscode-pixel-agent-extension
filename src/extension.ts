@@ -10,6 +10,7 @@ const PANEL_READY_TIMEOUT_MS = 2500;
 const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
 const MAX_COMMAND_PREVIEW_LENGTH = 120;
 const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = true;
+const TEST_EVENT_STEP_DELAY_MS = 420;
 
 type AgentId = 'scout' | 'builder' | 'reviewer';
 type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
@@ -75,7 +76,13 @@ export function activate(context: vscode.ExtensionContext) {
     openPixelPanel(context);
   });
 
-  context.subscriptions.push(panelCommand);
+  const emitTestEventsCommand = vscode.commands.registerCommand('pixelAgent.emitTestEvents', () => {
+    openPixelPanel(context);
+    emitSyntheticTestEvents();
+    void vscode.window.showInformationMessage('Pixel Agent test-events verstuurd.');
+  });
+
+  context.subscriptions.push(panelCommand, emitTestEventsCommand);
 
   const participant = vscode.chat.createChatParticipant(
     'pixel-copilot-agent.pixel',
@@ -659,6 +666,93 @@ function scheduleAgentIdle(agentId: AgentId, timeoutMs: number) {
     });
   }, timeoutMs);
   idleTimers.set(agentId, timer);
+}
+
+function emitSyntheticTestEvents() {
+  const runLabel = new Date().toLocaleTimeString();
+  const sequence: Array<{ delayMs: number; event: Omit<PixelRuntimeEvent, 'timestamp'> }> = [
+    {
+      delayMs: 0,
+      event: {
+        type: 'test.sequence.started',
+        summary: 'Test-sequence gestart',
+        detail: `Handmatige validatie run (${runLabel})`,
+        agentId: 'scout',
+        status: 'working',
+        progress: 10
+      }
+    },
+    {
+      delayMs: TEST_EVENT_STEP_DELAY_MS,
+      event: {
+        type: 'test.sequence.workspace',
+        summary: 'Workspace scan simulatie',
+        detail: 'Scannen van geopende files voor context.',
+        agentId: 'scout',
+        status: 'working',
+        progress: 45
+      }
+    },
+    {
+      delayMs: TEST_EVENT_STEP_DELAY_MS * 2,
+      event: {
+        type: 'test.sequence.builder',
+        summary: 'Builder verwerkt wijziging',
+        detail: 'src/extension.ts',
+        filePath: 'src/extension.ts',
+        agentId: 'builder',
+        status: 'working',
+        progress: 58
+      }
+    },
+    {
+      delayMs: TEST_EVENT_STEP_DELAY_MS * 3,
+      event: {
+        type: 'test.sequence.reviewerWarning',
+        summary: 'Reviewer vond waarschuwing',
+        detail: '1 warning in test-run (gesimuleerd).',
+        agentId: 'reviewer',
+        status: 'error',
+        progress: 100
+      }
+    },
+    {
+      delayMs: TEST_EVENT_STEP_DELAY_MS * 4,
+      event: {
+        type: 'test.sequence.reviewerResolved',
+        summary: 'Reviewer waarschuwing opgelost',
+        detail: 'Geen warnings meer in gesimuleerde run.',
+        agentId: 'reviewer',
+        status: 'completed',
+        progress: 100
+      }
+    },
+    {
+      delayMs: TEST_EVENT_STEP_DELAY_MS * 5,
+      event: {
+        type: 'test.sequence.finished',
+        summary: 'Test-sequence afgerond',
+        detail: 'Panel event rendering werkt zoals verwacht (gesimuleerd).',
+        agentId: 'builder',
+        status: 'completed',
+        progress: 100
+      }
+    }
+  ];
+
+  for (const step of sequence) {
+    setTimeout(() => {
+      emitRuntimeEvent({
+        ...step.event,
+        timestamp: Date.now()
+      });
+    }, step.delayMs);
+  }
+
+  const idleDelay = TEST_EVENT_STEP_DELAY_MS * 6;
+  scheduleAgentIdle('scout', idleDelay);
+  scheduleAgentIdle('builder', idleDelay + 400);
+  scheduleAgentIdle('reviewer', idleDelay + 800);
 }
 
 function emitRuntimeEvent(event: PixelRuntimeEvent) {

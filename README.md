@@ -40,6 +40,7 @@ npm install
 
 4. Test in de Extension Development Host:
 	- Command Palette: Pixel Agent: Open Panel
+	- Command Palette: Pixel Agent: Emit Test Events
 	- Copilot Chat: @pixel /show
 
 ## Scripts

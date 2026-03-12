@@ -21,6 +21,10 @@
       {
         "command": "pixelAgent.openPanel",
         "title": "Pixel Agent: Open Panel"
+      },
+      {
+        "command": "pixelAgent.emitTestEvents",
+        "title": "Pixel Agent: Emit Test Events"
       }
     ],
     "chatParticipants": [

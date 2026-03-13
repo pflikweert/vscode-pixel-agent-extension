@@ -5,6 +5,7 @@ const vscode = acquireVsCodeApi();
 type AgentId = 'scout' | 'builder' | 'reviewer';
 type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
 type AgentZone = 'lounge' | 'work';
+type AgentRoutine = 'normal' | 'pause' | 'dance' | 'sleep';
 
 interface AgentViewState {
   id: AgentId;
@@ -61,6 +62,9 @@ interface AgentVisualState extends AgentViewState {
   speechText: string;
   pauseUntilMs: number;
   nextPauseAtMs: number;
+  routine: AgentRoutine;
+  routineUntilMs: number;
+  nextRoutineAtMs: number;
 }
 
 type ExtensionMessage =
@@ -73,10 +77,54 @@ if (!app) {
 }
 
 const AGENT_INACTIVITY_LIMIT_MS = 10_000;
-const SPEECH_VISIBLE_MS = 2_800;
+const SPEECH_VISIBLE_MS = 2_000;
 const BUBBLE_MAX_LINES = 2;
 const BUBBLE_LINE_MAX_CHARS = 34;
 const MAX_VISIBLE_EVENTS = 14;
+const IDLE_CHAT_MIN_GAP_MS = 1_500;
+const IDLE_CHAT_MAX_GAP_MS = 4_800;
+const IDLE_REPLY_MIN_DELAY_MS = 450;
+const IDLE_REPLY_MAX_DELAY_MS = 1_050;
+
+interface IdleJoke {
+  setup: string;
+  reply: string;
+}
+
+const IDLE_JOKES: IdleJoke[] = [
+  {
+    setup: 'Waarom breekt de build altijd vrijdag?',
+    reply: 'Omdat bugs weekendplannen hebben.'
+  },
+  {
+    setup: 'Ik had een race condition opgelost.',
+    reply: 'Top, was je op tijd voor jezelf?'
+  },
+  {
+    setup: 'Deze feature was vijf minuten werk.',
+    reply: 'Ja, plus 2 uur naming-discussie.'
+  },
+  {
+    setup: 'Mijn test is flaky, maar alleen bij maanlicht.',
+    reply: 'Dan noemen we het een astrologische dependency.'
+  },
+  {
+    setup: 'Ik heb 1 semicolon gefixt.',
+    reply: 'Perfect, nu durft lint weer te ademen.'
+  },
+  {
+    setup: 'Code review zei: kleine wijziging.',
+    reply: 'Klein, als je 19 files negeert.'
+  },
+  {
+    setup: 'Waarom praat jij tegen de compiler?',
+    reply: 'Omdat docs soms stiller zijn dan errors.'
+  },
+  {
+    setup: 'Ik heb de bug niet kunnen reproduceren.',
+    reply: 'Mooi, dan reproduceert hij jou straks.'
+  }
+];
 
 interface AgentPersonality {
   idleLines: string[];
@@ -234,6 +282,7 @@ const agentState: Record<AgentId, AgentVisualState> = {
 
 const runtimeEvents: PixelRuntimeEvent[] = [];
 let currentGitState = createDefaultGitState();
+let nextIdleChatAt = Date.now() + Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
 
 function createDefaultGitState(): GitViewState {
   return {
@@ -279,7 +328,10 @@ function createDefaultAgent(
     lastSpeechAt: 0,
     speechText: '',
     pauseUntilMs: nowMs,
-    nextPauseAtMs: nowMs + 1200 + Math.random() * 2200
+    nextPauseAtMs: nowMs + 1200 + Math.random() * 2200,
+    routine: 'normal',
+    routineUntilMs: nowMs + randomRange(1800, 3600),
+    nextRoutineAtMs: nowMs + randomRange(1100, 2600)
   };
 }
 
@@ -351,21 +403,108 @@ function pickAgentIcon(agent: AgentVisualState, seed: number): string {
   return icons[index];
 }
 
+function pickRandom<T>(items: readonly T[]): T {
+  const index = Math.floor(Math.random() * items.length);
+  return items[index];
+}
+
+function setAgentSpeechText(agent: AgentVisualState, text: string, timestamp: number = Date.now()) {
+  const normalized = shorten(text.replace(/\s+/g, ' ').trim(), 96);
+  agent.speechText = normalized;
+  agent.lastSpeechAt = timestamp;
+}
+
+function chooseNextIdleRoutine(agent: AgentVisualState, nowMs: number) {
+  const roll = Math.random();
+  let routine: AgentRoutine = 'normal';
+  if (roll >= 0.56 && roll < 0.74) {
+    routine = 'pause';
+  } else if (roll >= 0.74 && roll < 0.9) {
+    routine = 'dance';
+  } else if (roll >= 0.9) {
+    routine = 'sleep';
+  }
+
+  agent.routine = routine;
+
+  if (routine === 'pause') {
+    agent.routineUntilMs = nowMs + randomRange(1300, 2600);
+  } else if (routine === 'dance') {
+    agent.routineUntilMs = nowMs + randomRange(1800, 3600);
+  } else if (routine === 'sleep') {
+    agent.routineUntilMs = nowMs + randomRange(2000, 3900);
+  } else {
+    agent.routineUntilMs = nowMs + randomRange(1700, 3200);
+  }
+
+  agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2400);
+}
+
+function maybeRunIdleChatter() {
+  const now = Date.now();
+  if (now < nextIdleChatAt) {
+    return;
+  }
+
+  const idleAgents = agentOrder
+    .map((id) => agentState[id])
+    .filter((agent) => agent.status === 'idle' && agent.routine !== 'sleep');
+
+  if (idleAgents.length < 2) {
+    nextIdleChatAt = now + Math.round(randomRange(900, 2200));
+    return;
+  }
+
+  if (Math.random() < 0.34) {
+    nextIdleChatAt = now + Math.round(randomRange(1200, 2800));
+    return;
+  }
+
+  const joke = pickRandom(IDLE_JOKES);
+  const speaker = pickRandom(idleAgents);
+  const responses = idleAgents.filter((agent) => agent.id !== speaker.id);
+  const responder = pickRandom(responses);
+
+  setAgentSpeechText(speaker, `${joke.setup} ${pickAgentIcon(speaker, now)}`, now);
+
+  const delay = Math.round(randomRange(IDLE_REPLY_MIN_DELAY_MS, IDLE_REPLY_MAX_DELAY_MS));
+  setTimeout(() => {
+    if (responder.status !== 'idle' || responder.routine === 'sleep') {
+      return;
+    }
+    setAgentSpeechText(responder, `${joke.reply} ${pickAgentIcon(responder, Date.now())}`);
+  }, delay);
+
+  nextIdleChatAt = now + Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
+}
+
 function wrapWords(line: string, maxChars: number): string[] {
   const words = line.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) {
     return [];
   }
 
+  const expanded: string[] = [];
+  for (const word of words) {
+    if (word.length <= maxChars) {
+      expanded.push(word);
+      continue;
+    }
+
+    for (let index = 0; index < word.length; index += maxChars) {
+      expanded.push(word.slice(index, index + maxChars));
+    }
+  }
+
   const wrapped: string[] = [];
-  let current = words[0];
-  for (let i = 1; i < words.length; i += 1) {
-    const next = `${current} ${words[i]}`;
+  let current = expanded[0];
+  for (let i = 1; i < expanded.length; i += 1) {
+    const next = `${current} ${expanded[i]}`;
     if (next.length <= maxChars) {
       current = next;
     } else {
       wrapped.push(current);
-      current = words[i];
+      current = expanded[i];
     }
   }
   wrapped.push(current);
@@ -419,8 +558,7 @@ function buildSpeechFromEvent(agent: AgentVisualState, event: PixelRuntimeEvent)
 }
 
 function setAgentSpeech(agent: AgentVisualState, event: PixelRuntimeEvent) {
-  agent.speechText = buildSpeechFromEvent(agent, event);
-  agent.lastSpeechAt = event.timestamp || Date.now();
+  setAgentSpeechText(agent, buildSpeechFromEvent(agent, event), event.timestamp || Date.now());
 }
 
 function renderAgents() {
@@ -534,8 +672,8 @@ function applySnapshot(snapshot: RuntimeState) {
     };
 
     if (now - incoming.lastEventAt <= SPEECH_VISIBLE_MS) {
-      agentState[agentId].speechText = incoming.task ? shorten(incoming.task, 88) : getActiveLine(agentState[agentId]);
-      agentState[agentId].lastSpeechAt = incoming.lastEventAt;
+      const speech = incoming.task ? shorten(incoming.task, 88) : getActiveLine(agentState[agentId]);
+      setAgentSpeechText(agentState[agentId], speech, incoming.lastEventAt);
     } else {
       agentState[agentId].speechText = '';
       agentState[agentId].lastSpeechAt = 0;
@@ -695,13 +833,43 @@ function limbPalette(agent: AgentVisualState): { arm: string; hand: string; boot
   return { arm: '#ffd3de', hand: '#ff9eb8', boot: '#c8748f' };
 }
 
+function routineBadgeText(agent: AgentVisualState, nowMs: number): string {
+  if (agent.status === 'idle' && agent.routine === 'sleep') {
+    return 'zz';
+  }
+  if (agent.status === 'idle' && agent.routine === 'dance') {
+    return '♪';
+  }
+  if (agent.status === 'idle' && agent.routine === 'pause') {
+    return '...';
+  }
+  return pickAgentIcon(agent, nowMs);
+}
+
+function drawAgentIconBadge(agent: AgentVisualState, x: number, y: number, nowMs: number) {
+  const badge = routineBadgeText(agent, nowMs);
+  ctx.fillStyle = 'rgba(18, 24, 38, 0.84)';
+  ctx.fillRect(x - 4, y - 10, 14, 7);
+  ctx.fillStyle = '#eaf3ff';
+  ctx.font = '6px monospace';
+  ctx.fillText(badge, x - 2, y - 5);
+}
+
 function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
-  const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
+  const routineDance = agent.status === 'idle' && agent.routine === 'dance';
+  const routineSleep = agent.status === 'idle' && agent.routine === 'sleep';
+  const routinePause = agent.status === 'idle' && agent.routine === 'pause';
+
+  const danceBoost = routineDance ? Math.sin(nowMs * 0.02 + agent.bob) * 1.8 : 0;
+  const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5 + danceBoost;
   const x = Math.floor(agent.x);
   const y = Math.floor(agent.y + wobble);
-  const paused = nowMs < agent.pauseUntilMs;
+  const paused = nowMs < agent.pauseUntilMs || routinePause || routineSleep;
   const cadence = agent.id === 'builder' ? 14 : agent.id === 'reviewer' ? 18 : 16;
-  const step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
+  let step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
+  if (routineDance) {
+    step = Math.sin(nowMs * 0.03 + agent.bob) > 0 ? 1 : -1;
+  }
   const palette = limbPalette(agent);
 
   ctx.fillStyle = '#2f3650';
@@ -725,11 +893,17 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
   }
 
   ctx.fillStyle = '#f6f7ff';
-  ctx.fillRect(x + 3, y + 3, 2, 2);
-  ctx.fillRect(x + 7, y + 3, 2, 2);
-
-  ctx.fillStyle = '#202534';
-  ctx.fillRect(x + 4, y + 8, 4, 1);
+  if (routineSleep) {
+    ctx.fillRect(x + 3, y + 4, 2, 1);
+    ctx.fillRect(x + 7, y + 4, 2, 1);
+    ctx.fillStyle = '#202534';
+    ctx.fillRect(x + 4, y + 8, 4, 1);
+  } else {
+    ctx.fillRect(x + 3, y + 3, 2, 2);
+    ctx.fillRect(x + 7, y + 3, 2, 2);
+    ctx.fillStyle = '#202534';
+    ctx.fillRect(x + 4, y + 8, 4, 1);
+  }
 
   ctx.fillStyle = palette.boot;
   ctx.fillRect(x + 2, y + 12 + step, 2, 2);
@@ -743,6 +917,8 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     ctx.fillStyle = blink;
     ctx.fillRect(x + 2, y - 3, 8, 1);
   }
+
+  drawAgentIconBadge(agent, x, y, nowMs);
 }
 
 function drawSpeechCloud(agent: AgentVisualState, nowMs: number) {
@@ -766,7 +942,7 @@ function drawSpeechCloud(agent: AgentVisualState, nowMs: number) {
   const cloudHeight = 6 + lines.length * 9;
   const rawX = blockX + 6 - Math.floor(cloudWidth / 2);
   const cloudX = clamp(rawX, 4, canvas.width - cloudWidth - 4);
-  const cloudY = blockY - (cloudHeight + 7);
+  const cloudY = Math.max(4, blockY - (cloudHeight + 7));
 
   ctx.fillStyle = '#f6f7ff';
   ctx.fillRect(cloudX, cloudY, cloudWidth, cloudHeight);
@@ -793,6 +969,16 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
 
   agent.lane = clamp(agent.lane, 0, lanePool.length - 1);
 
+  if (agent.status === 'idle') {
+    if (nowMs >= agent.nextRoutineAtMs) {
+      chooseNextIdleRoutine(agent, nowMs);
+    }
+  } else {
+    agent.routine = 'normal';
+    agent.routineUntilMs = nowMs;
+    agent.nextRoutineAtMs = nowMs + randomRange(1200, 2800);
+  }
+
   if (nowMs >= agent.nextPauseAtMs) {
     const busyPause = inWorkZone && agent.status === 'working';
     const pauseDuration = busyPause ? randomRange(900, 2200) : randomRange(350, 1100);
@@ -800,7 +986,8 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
     agent.nextPauseAtMs = agent.pauseUntilMs + (busyPause ? randomRange(1300, 3600) : randomRange(2100, 4900));
   }
 
-  const paused = nowMs < agent.pauseUntilMs;
+  const routinePause = agent.status === 'idle' && (agent.routine === 'pause' || agent.routine === 'sleep');
+  const paused = nowMs < agent.pauseUntilMs || routinePause;
 
   const speedBase = inWorkZone ? 1.1 : 0.85;
   const speed = speedBase * (inWorkZone ? personality.workSpeed : personality.loungeSpeed);
@@ -809,7 +996,7 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
   }
   const targetY = lanePool[agent.lane];
   agent.y += (targetY - agent.y) * (inWorkZone ? 0.09 : 0.07);
-  if (!paused) {
+  if (!paused || (agent.status === 'idle' && agent.routine === 'dance')) {
     agent.frame += 1;
   }
 
@@ -817,6 +1004,10 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
     agent.x += Math.sin(nowMs * personality.driftFreq + agent.bob) * personality.driftAmp;
     if (agent.status === 'idle') {
       agent.y += Math.sin(nowMs * personality.poseFreq + agent.bob) * personality.poseAmp;
+      if (agent.routine === 'dance') {
+        agent.x += Math.sin(nowMs * 0.016 + agent.bob) * 0.45;
+        agent.y += Math.cos(nowMs * 0.023 + agent.bob) * 0.4;
+      }
     }
   }
 
@@ -830,6 +1021,7 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
 function drawFrame() {
   const nowMs = performance.now();
   drawScene(nowMs);
+  maybeRunIdleChatter();
 
   for (const id of agentOrder) {
     const agent = agentState[id];
@@ -870,6 +1062,9 @@ setInterval(() => {
       agent.status = 'idle';
       agent.progress = 0;
       agent.task = 'wacht in lounge';
+      agent.routine = 'normal';
+      agent.routineUntilMs = performance.now() + randomRange(1400, 2600);
+      agent.nextRoutineAtMs = performance.now() + randomRange(800, 2000);
       applyZoneFromStatus(agent);
       changed = true;
     }

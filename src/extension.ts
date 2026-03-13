@@ -9,7 +9,7 @@ const DEV_SERVER_TIMEOUT_MS = 1200;
 const PANEL_READY_TIMEOUT_MS = 2500;
 const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
 const MAX_COMMAND_PREVIEW_LENGTH = 170;
-const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = true;
+const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = false;
 const TEST_EVENT_STEP_DELAY_MS = 420;
 const AGENT_INACTIVITY_IDLE_MS = 10000;
 const MIN_AGENT_IDLE_MS = 2200;
@@ -1514,11 +1514,10 @@ function openPixelPanel(context: vscode.ExtensionContext) {
   if (panelRef) {
     panelRef.reveal(vscode.ViewColumn.Beside);
 
-    if (!panelReady) {
-      preferredPanelMode = 'embedded';
-      void renderPanelHtml(panelRef, context);
-      armPanelReadyWatchdog(context);
-    }
+    // Always refresh HTML on reveal so a stale retained webview cannot stay visually broken.
+    preferredPanelMode = 'auto';
+    void renderPanelHtml(panelRef, context);
+    armPanelReadyWatchdog(context);
 
     postSnapshot();
     emitRuntimeEvent({
@@ -1622,7 +1621,7 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
   const inDevMode = context.extensionMode === vscode.ExtensionMode.Development;
 
   if (preferredPanelMode === 'embedded') {
-    panel.webview.html = getWebviewHtml(panel.webview);
+    await renderEmbeddedPanelHtml(panel, context.extensionUri);
     return;
   }
 
@@ -1645,7 +1644,7 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
   const probe = await probeDevServer(devServerUrl);
   if (probe.ok) {
     if (AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED) {
-      panel.webview.html = getWebviewHtml(panel.webview);
+      await renderEmbeddedPanelHtml(panel, context.extensionUri);
       return;
     }
 
@@ -1655,6 +1654,16 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
 
   const hasBundle = await hasProductionBundle(context.extensionUri);
   panel.webview.html = getDevServerFallbackHtml(panel.webview, devServerUrl, probe.reason, hasBundle);
+}
+
+async function renderEmbeddedPanelHtml(panel: vscode.WebviewPanel, extensionUri: vscode.Uri): Promise<void> {
+  const hasBundle = await hasProductionBundle(extensionUri);
+  if (hasBundle) {
+    panel.webview.html = getProdWebviewHtml(panel.webview, extensionUri);
+    return;
+  }
+
+  panel.webview.html = getWebviewHtml(panel.webview);
 }
 
 function clearPanelReadyWatchdog() {
@@ -2366,6 +2375,23 @@ function getWebviewHtml(webview: vscode.Webview): string {
       right: CANVAS_W - 20
     };
     const INACTIVITY_LIMIT_MS = 60000;
+    const SPEECH_VISIBLE_MS = 2000;
+    const BUBBLE_MAX_LINES = 2;
+    const BUBBLE_LINE_MAX_CHARS = 34;
+    const IDLE_CHAT_MIN_GAP_MS = 1500;
+    const IDLE_CHAT_MAX_GAP_MS = 4800;
+    const IDLE_REPLY_MIN_DELAY_MS = 450;
+    const IDLE_REPLY_MAX_DELAY_MS = 1050;
+    const IDLE_JOKES = [
+      { setup: 'Waarom breekt de build altijd vrijdag?', reply: 'Omdat bugs weekendplannen hebben.' },
+      { setup: 'Ik had een race condition opgelost.', reply: 'Top, was je op tijd voor jezelf?' },
+      { setup: 'Deze feature was vijf minuten werk.', reply: 'Ja, plus 2 uur naming-discussie.' },
+      { setup: 'Mijn test is flaky, maar alleen bij maanlicht.', reply: 'Dan noemen we het een astrologische dependency.' },
+      { setup: 'Ik heb 1 semicolon gefixt.', reply: 'Perfect, nu durft lint weer te ademen.' },
+      { setup: 'Code review zei: kleine wijziging.', reply: 'Klein, als je 19 files negeert.' },
+      { setup: 'Waarom praat jij tegen de compiler?', reply: 'Omdat docs soms stiller zijn dan errors.' },
+      { setup: 'Ik heb de bug niet kunnen reproduceren.', reply: 'Mooi, dan reproduceert hij jou straks.' }
+    ];
     const AGENT_PERSONALITIES = {
       scout: {
         idleLines: [
@@ -2376,6 +2402,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           'nog een snelle map-check.'
         ],
         workFallback: 'context en impact checken',
+        icons: ['🙂', '🧭', '✨'],
         loungeSpeed: 0.95,
         workSpeed: 1.05,
         driftAmp: 0.14,
@@ -2392,6 +2419,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           'ready voor de volgende feature.'
         ],
         workFallback: 'implementatie uitwerken',
+        icons: ['😄', '🛠️', '🚀'],
         loungeSpeed: 1.02,
         workSpeed: 1.18,
         driftAmp: 0.09,
@@ -2408,6 +2436,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           'klaar voor een snelle review.'
         ],
         workFallback: 'validatie en checks draaien',
+        icons: ['😉', '🔎', '✅'],
         loungeSpeed: 0.88,
         workSpeed: 0.97,
         driftAmp: 0.07,
@@ -2417,10 +2446,77 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
     };
 
+    const nowMs = performance.now();
     const agents = [
-      { id: 'scout', name: 'Scout', x: 42, y: loungeLaneYs[0], vx: 0.46, frame: 0, bob: 0.3, color: '#69f0c4', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 0, zone: 'lounge', lastEventAt: Date.now() },
-      { id: 'builder', name: 'Builder', x: 92, y: loungeLaneYs[1], vx: -0.41, frame: 0, bob: 1.4, color: '#ffd166', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 1, zone: 'lounge', lastEventAt: Date.now() },
-      { id: 'reviewer', name: 'Reviewer', x: 126, y: loungeLaneYs[2], vx: 0.52, frame: 0, bob: 2.5, color: '#ff6f91', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 2, zone: 'lounge', lastEventAt: Date.now() }
+      {
+        id: 'scout',
+        name: 'Scout',
+        x: 42,
+        y: loungeLaneYs[0],
+        vx: 0.46,
+        frame: 0,
+        bob: 0.3,
+        color: '#69f0c4',
+        task: 'wacht in lounge',
+        status: 'idle',
+        progress: 0,
+        lane: 0,
+        zone: 'lounge',
+        lastEventAt: Date.now(),
+        lastSpeechAt: 0,
+        speechText: '',
+        pauseUntilMs: nowMs,
+        nextPauseAtMs: nowMs + 1200 + Math.random() * 2200,
+        routine: 'normal',
+        routineUntilMs: nowMs + 1800 + Math.random() * 1200,
+        nextRoutineAtMs: nowMs + 1100 + Math.random() * 1500
+      },
+      {
+        id: 'builder',
+        name: 'Builder',
+        x: 92,
+        y: loungeLaneYs[1],
+        vx: -0.41,
+        frame: 0,
+        bob: 1.4,
+        color: '#ffd166',
+        task: 'wacht in lounge',
+        status: 'idle',
+        progress: 0,
+        lane: 1,
+        zone: 'lounge',
+        lastEventAt: Date.now(),
+        lastSpeechAt: 0,
+        speechText: '',
+        pauseUntilMs: nowMs,
+        nextPauseAtMs: nowMs + 1200 + Math.random() * 2200,
+        routine: 'normal',
+        routineUntilMs: nowMs + 1800 + Math.random() * 1200,
+        nextRoutineAtMs: nowMs + 1100 + Math.random() * 1500
+      },
+      {
+        id: 'reviewer',
+        name: 'Reviewer',
+        x: 126,
+        y: loungeLaneYs[2],
+        vx: 0.52,
+        frame: 0,
+        bob: 2.5,
+        color: '#ff6f91',
+        task: 'wacht in lounge',
+        status: 'idle',
+        progress: 0,
+        lane: 2,
+        zone: 'lounge',
+        lastEventAt: Date.now(),
+        lastSpeechAt: 0,
+        speechText: '',
+        pauseUntilMs: nowMs,
+        nextPauseAtMs: nowMs + 1200 + Math.random() * 2200,
+        routine: 'normal',
+        routineUntilMs: nowMs + 1800 + Math.random() * 1200,
+        nextRoutineAtMs: nowMs + 1100 + Math.random() * 1500
+      }
     ];
 
     const agentById = new Map();
@@ -2430,6 +2526,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     const eventLog = [];
+    let nextIdleChatAt = Date.now() + Math.round(IDLE_CHAT_MIN_GAP_MS + Math.random() * (IDLE_CHAT_MAX_GAP_MS - IDLE_CHAT_MIN_GAP_MS));
 
     function renderGitState(git) {
       if (!git) {
@@ -2479,26 +2576,194 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const tick = Math.floor(nowMs / 4200);
       const offset = agent.id.length * 3 + agent.lane;
       const index = (tick + offset) % lines.length;
-      return lines[index];
+      const icon = pickAgentIcon(agent, nowMs);
+      return lines[index] + ' ' + icon;
     }
 
     function getActiveLine(agent) {
       const fallback = AGENT_PERSONALITIES[agent.id].workFallback;
       const core = shorten(agent.task || fallback, 22);
+      const icon = pickAgentIcon(agent, Date.now());
 
       if (agent.status === 'completed') {
-        return 'klaar: ' + core;
+        return 'klaar: ' + core + ' ' + icon;
       }
       if (agent.status === 'error') {
-        return 'let op: ' + core;
+        return 'let op: ' + core + ' ' + icon;
       }
       if (agent.id === 'scout') {
-        return 'scan: ' + core;
+        return 'scan: ' + core + ' ' + icon;
       }
       if (agent.id === 'builder') {
-        return 'bouwt: ' + core;
+        return 'bouwt: ' + core + ' ' + icon;
       }
-      return 'checkt: ' + core;
+      return 'checkt: ' + core + ' ' + icon;
+    }
+
+    function pickAgentIcon(agent, seed) {
+      const icons = AGENT_PERSONALITIES[agent.id].icons;
+      const index = Math.abs(Math.floor(seed / 850) + agent.lane + agent.id.length) % icons.length;
+      return icons[index];
+    }
+
+    function pickRandom(items) {
+      const index = Math.floor(Math.random() * items.length);
+      return items[index];
+    }
+
+    function randomRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function setAgentSpeechText(agent, text, timestamp) {
+      const when = typeof timestamp === 'number' ? timestamp : Date.now();
+      const normalized = shorten(String(text || '').replace(/\s+/g, ' ').trim(), 96);
+      agent.speechText = normalized;
+      agent.lastSpeechAt = when;
+    }
+
+    function chooseNextIdleRoutine(agent, nowMs) {
+      const roll = Math.random();
+      let routine = 'normal';
+      if (roll >= 0.56 && roll < 0.74) {
+        routine = 'pause';
+      } else if (roll >= 0.74 && roll < 0.9) {
+        routine = 'dance';
+      } else if (roll >= 0.9) {
+        routine = 'sleep';
+      }
+
+      agent.routine = routine;
+
+      if (routine === 'pause') {
+        agent.routineUntilMs = nowMs + randomRange(1300, 2600);
+      } else if (routine === 'dance') {
+        agent.routineUntilMs = nowMs + randomRange(1800, 3600);
+      } else if (routine === 'sleep') {
+        agent.routineUntilMs = nowMs + randomRange(2000, 3900);
+      } else {
+        agent.routineUntilMs = nowMs + randomRange(1700, 3200);
+      }
+
+      agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2400);
+    }
+
+    function maybeRunIdleChatter() {
+      const now = Date.now();
+      if (now < nextIdleChatAt) {
+        return;
+      }
+
+      const idleAgents = agents.filter((agent) => agent.status === 'idle' && agent.routine !== 'sleep');
+      if (idleAgents.length < 2) {
+        nextIdleChatAt = now + Math.round(randomRange(900, 2200));
+        return;
+      }
+
+      if (Math.random() < 0.34) {
+        nextIdleChatAt = now + Math.round(randomRange(1200, 2800));
+        return;
+      }
+
+      const joke = pickRandom(IDLE_JOKES);
+      const speaker = pickRandom(idleAgents);
+      const responses = idleAgents.filter((agent) => agent.id !== speaker.id);
+      const responder = pickRandom(responses);
+
+      setAgentSpeechText(speaker, joke.setup + ' ' + pickAgentIcon(speaker, now), now);
+
+      const delay = Math.round(randomRange(IDLE_REPLY_MIN_DELAY_MS, IDLE_REPLY_MAX_DELAY_MS));
+      setTimeout(() => {
+        if (responder.status !== 'idle' || responder.routine === 'sleep') {
+          return;
+        }
+        setAgentSpeechText(responder, joke.reply + ' ' + pickAgentIcon(responder, Date.now()));
+      }, delay);
+
+      nextIdleChatAt = now + Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
+    }
+
+    function wrapWords(line, maxChars) {
+      const words = line.trim().split(/\s+/).filter(Boolean);
+      if (words.length === 0) {
+        return [];
+      }
+
+      const expanded = [];
+      for (const word of words) {
+        if (word.length <= maxChars) {
+          expanded.push(word);
+          continue;
+        }
+
+        for (let index = 0; index < word.length; index += maxChars) {
+          expanded.push(word.slice(index, index + maxChars));
+        }
+      }
+
+      const wrapped = [];
+      let current = expanded[0];
+      for (let i = 1; i < expanded.length; i += 1) {
+        const next = current + ' ' + expanded[i];
+        if (next.length <= maxChars) {
+          current = next;
+        } else {
+          wrapped.push(current);
+          current = expanded[i];
+        }
+      }
+      wrapped.push(current);
+      return wrapped;
+    }
+
+    function wrapBubbleText(text, maxChars, maxLines) {
+      const parts = String(text || '')
+        .split('\n')
+        .map((part) => part.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+
+      const lines = [];
+      for (const part of parts) {
+        const wrapped = wrapWords(part, maxChars);
+        for (const line of wrapped) {
+          lines.push(line);
+          if (lines.length >= maxLines) {
+            break;
+          }
+        }
+        if (lines.length >= maxLines) {
+          break;
+        }
+      }
+
+      if (lines.length === 0) {
+        return [];
+      }
+
+      const joined = parts.join(' ');
+      const rendered = lines.join(' ');
+      if (rendered.length < joined.length) {
+        const lastIndex = lines.length - 1;
+        lines[lastIndex] = shorten(lines[lastIndex], Math.max(4, maxChars - 1));
+        if (!lines[lastIndex].endsWith('...')) {
+          lines[lastIndex] = shorten(lines[lastIndex], Math.max(4, maxChars - 4)) + '...';
+        }
+      }
+
+      return lines;
+    }
+
+    function buildSpeechFromEvent(agent, event) {
+      const summary = event.summary ? shorten(String(event.summary).replace(/\s+/g, ' ').trim(), 74) : getActiveLine(agent);
+      const detail = event.detail ? shorten(String(event.detail).trim(), 90) : '';
+      if (detail && detail !== summary) {
+        return summary + '\n' + detail;
+      }
+      return summary || getIdleLine(agent, event.timestamp || Date.now());
+    }
+
+    function setAgentSpeech(agent, event) {
+      setAgentSpeechText(agent, buildSpeechFromEvent(agent, event), event.timestamp || Date.now());
     }
 
     function setStatusLine(text) {
@@ -2595,6 +2860,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         agent.task = event.summary;
       }
       agent.lastEventAt = event.timestamp || Date.now();
+      setAgentSpeech(agent, event);
       applyZoneFromStatus(agent);
       renderAgentRows();
       updateStatusFromAgents();
@@ -2618,6 +2884,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
           agent.status = incoming.status || agent.status;
           agent.progress = typeof incoming.progress === 'number' ? incoming.progress : agent.progress;
           agent.lastEventAt = incoming.lastEventAt || agent.lastEventAt;
+
+          if (Date.now() - agent.lastEventAt <= SPEECH_VISIBLE_MS) {
+            const speech = incoming.task ? shorten(incoming.task, 88) : getActiveLine(agent);
+            setAgentSpeechText(agent, speech, agent.lastEventAt);
+          } else {
+            agent.speechText = '';
+            agent.lastSpeechAt = 0;
+          }
+
           applyZoneFromStatus(agent);
         }
       }
@@ -2660,6 +2935,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
           agent.status = 'idle';
           agent.progress = 0;
           agent.task = 'wacht in lounge';
+          agent.routine = 'normal';
+          agent.routineUntilMs = performance.now() + randomRange(1400, 2600);
+          agent.nextRoutineAtMs = performance.now() + randomRange(800, 2000);
           applyZoneFromStatus(agent);
           changed = true;
         }
@@ -2781,12 +3059,43 @@ function getWebviewHtml(webview: vscode.Webview): string {
       return { arm: '#ffd3de', hand: '#ff9eb8', boot: '#c8748f' };
     }
 
+    function routineBadgeText(agent, nowMs) {
+      if (agent.status === 'idle' && agent.routine === 'sleep') {
+        return 'zz';
+      }
+      if (agent.status === 'idle' && agent.routine === 'dance') {
+        return '♪';
+      }
+      if (agent.status === 'idle' && agent.routine === 'pause') {
+        return '...';
+      }
+      return pickAgentIcon(agent, nowMs);
+    }
+
+    function drawAgentIconBadge(agent, x, y, nowMs) {
+      const badge = routineBadgeText(agent, nowMs);
+      ctx.fillStyle = 'rgba(18, 24, 38, 0.84)';
+      ctx.fillRect(x - 4, y - 10, 14, 7);
+      ctx.fillStyle = '#eaf3ff';
+      ctx.font = '6px monospace';
+      ctx.fillText(badge, x - 2, y - 5);
+    }
+
     function drawAgentBlock(agent, nowMs) {
-      const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
+      const routineDance = agent.status === 'idle' && agent.routine === 'dance';
+      const routineSleep = agent.status === 'idle' && agent.routine === 'sleep';
+      const routinePause = agent.status === 'idle' && agent.routine === 'pause';
+
+      const danceBoost = routineDance ? Math.sin(nowMs * 0.02 + agent.bob) * 1.8 : 0;
+      const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5 + danceBoost;
       const x = Math.floor(agent.x);
       const y = Math.floor(agent.y + wobble);
+      const paused = nowMs < agent.pauseUntilMs || routinePause || routineSleep;
       const cadence = agent.id === 'builder' ? 14 : agent.id === 'reviewer' ? 18 : 16;
-      const step = agent.frame % cadence < cadence / 2 ? 0 : 1;
+      let step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
+      if (routineDance) {
+        step = Math.sin(nowMs * 0.03 + agent.bob) > 0 ? 1 : -1;
+      }
       const palette = limbPalette(agent);
 
       ctx.fillStyle = '#2f3650';
@@ -2810,11 +3119,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
       }
 
       ctx.fillStyle = '#f6f7ff';
-      ctx.fillRect(x + 3, y + 3, 2, 2);
-      ctx.fillRect(x + 7, y + 3, 2, 2);
-
-      ctx.fillStyle = '#202534';
-      ctx.fillRect(x + 4, y + 8, 4, 1);
+      if (routineSleep) {
+        ctx.fillRect(x + 3, y + 4, 2, 1);
+        ctx.fillRect(x + 7, y + 4, 2, 1);
+        ctx.fillStyle = '#202534';
+        ctx.fillRect(x + 4, y + 8, 4, 1);
+      } else {
+        ctx.fillRect(x + 3, y + 3, 2, 2);
+        ctx.fillRect(x + 7, y + 3, 2, 2);
+        ctx.fillStyle = '#202534';
+        ctx.fillRect(x + 4, y + 8, 4, 1);
+      }
 
       ctx.fillStyle = palette.boot;
       ctx.fillRect(x + 2, y + 12 + step, 2, 2);
@@ -2828,22 +3143,35 @@ function getWebviewHtml(webview: vscode.Webview): string {
         ctx.fillStyle = blink;
         ctx.fillRect(x + 2, y - 3, 8, 1);
       }
+
+      drawAgentIconBadge(agent, x, y, nowMs);
     }
 
     function drawSpeechCloud(agent, nowMs) {
+      const now = Date.now();
+      if (!agent.speechText || now - agent.lastSpeechAt > SPEECH_VISIBLE_MS) {
+        return;
+      }
+
       const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
       const blockX = Math.floor(agent.x);
       const blockY = Math.floor(agent.y + wobble);
 
       ctx.font = '8px monospace';
-      const bubbleText = agent.status === 'idle' ? getIdleLine(agent, nowMs) : getActiveLine(agent);
-      const label = agent.name + ': ' + bubbleText;
-      const textWidth = Math.ceil(ctx.measureText(label).width);
-      const cloudWidth = Math.max(74, textWidth + 10);
-      const cloudHeight = 13;
+      const lines = wrapBubbleText(agent.name + ': ' + agent.speechText, BUBBLE_LINE_MAX_CHARS, BUBBLE_MAX_LINES);
+      if (lines.length === 0) {
+        return;
+      }
+
+      const textWidth = Math.max.apply(
+        null,
+        lines.map((line) => Math.ceil(ctx.measureText(line).width))
+      );
+      const cloudWidth = Math.max(84, textWidth + 12);
+      const cloudHeight = 6 + lines.length * 9;
       const rawX = blockX + 6 - Math.floor(cloudWidth / 2);
       const cloudX = clamp(rawX, 4, canvas.width - cloudWidth - 4);
-      const cloudY = blockY - 20;
+      const cloudY = Math.max(4, blockY - (cloudHeight + 7));
 
       ctx.fillStyle = '#f6f7ff';
       ctx.fillRect(cloudX, cloudY, cloudWidth, cloudHeight);
@@ -2857,7 +3185,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
       ctx.fillRect(blockX + 6, cloudY + cloudHeight + 2, 1, 2);
 
       ctx.fillStyle = '#1f2738';
-      ctx.fillText(label, cloudX + 5, cloudY + 9);
+      for (let index = 0; index < lines.length; index += 1) {
+        ctx.fillText(lines[index], cloudX + 5, cloudY + 8 + index * 9);
+      }
     }
 
     function tickAgent(agent, nowMs) {
@@ -2868,17 +3198,45 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
       agent.lane = clamp(agent.lane, 0, lanePool.length - 1);
 
+      if (agent.status === 'idle') {
+        if (nowMs >= agent.nextRoutineAtMs) {
+          chooseNextIdleRoutine(agent, nowMs);
+        }
+      } else {
+        agent.routine = 'normal';
+        agent.routineUntilMs = nowMs;
+        agent.nextRoutineAtMs = nowMs + randomRange(1200, 2800);
+      }
+
+      if (nowMs >= agent.nextPauseAtMs) {
+        const busyPause = inWorkZone && agent.status === 'working';
+        const pauseDuration = busyPause ? randomRange(900, 2200) : randomRange(350, 1100);
+        agent.pauseUntilMs = nowMs + pauseDuration;
+        agent.nextPauseAtMs = agent.pauseUntilMs + (busyPause ? randomRange(1300, 3600) : randomRange(2100, 4900));
+      }
+
+      const routinePause = agent.status === 'idle' && (agent.routine === 'pause' || agent.routine === 'sleep');
+      const paused = nowMs < agent.pauseUntilMs || routinePause;
+
       const speedBase = inWorkZone ? 1.1 : 0.85;
       const speed = speedBase * (inWorkZone ? personality.workSpeed : personality.loungeSpeed);
-      agent.x += agent.vx * speed;
+      if (!paused) {
+        agent.x += agent.vx * speed;
+      }
       const targetY = lanePool[agent.lane];
       agent.y += (targetY - agent.y) * (inWorkZone ? 0.09 : 0.07);
-      agent.frame += 1;
+      if (!paused || (agent.status === 'idle' && agent.routine === 'dance')) {
+        agent.frame += 1;
+      }
 
       if (!inWorkZone) {
         agent.x += Math.sin(nowMs * personality.driftFreq + agent.bob) * personality.driftAmp;
         if (agent.status === 'idle') {
           agent.y += Math.sin(nowMs * personality.poseFreq + agent.bob) * personality.poseAmp;
+          if (agent.routine === 'dance') {
+            agent.x += Math.sin(nowMs * 0.016 + agent.bob) * 0.45;
+            agent.y += Math.cos(nowMs * 0.023 + agent.bob) * 0.4;
+          }
         }
       }
 
@@ -2895,6 +3253,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
 
       drawOfficeScene(nowMs);
+      maybeRunIdleChatter();
 
       for (const agent of agents) {
         tickAgent(agent, nowMs);

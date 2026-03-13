@@ -8,7 +8,7 @@
 - **Codex import & auto-discovery**: import van externe Codex/OpenAI agent events via JSONL-bestand of automatische detectie van lokale Codex sessies.
 - **Verbeterde panel fallback**: robuuste recovery bij devserver issues, automatische terugval op embedded/prod UI.
 - **Uitgebreide event types**: nu ook Copilot LM, Codex, export, git, terminal, tasks, diagnostics en meer.
-- **Dynamische agent scene**: command-room met Ops AI monitor, workstations, bureau-specifieke werkanimaties, idle-lus, plantzorg, kantoor-kat cameos en custom sprites.
+- **Dynamische agent scene**: command-room met Ops AI monitor, workstations, bureau-specifieke werkanimaties, idle-lus, plantzorg, routegestuurde kantoor-kat cameos, klikbare scene-hotspots en custom sprites.
 
 
 Standalone VS Code extensie in een eigen repository met:
@@ -30,7 +30,8 @@ Standalone VS Code extensie in een eigen repository met:
 - terminal command telemetry (start/einde + exit status), inclusief source-detectie voor `local` en `codex`
 - vernieuwde vierkante lounge-scene met kamerachtergrond, workstations, Ops AI monitor, speech bubbles en idle acties
 - git-aware Ops AI idle chatter die inspeelt op dirty branches en lounge-status
-- spontane kantoor-kat visits met meerdere persoonlijkheden, animaties en meow/speech bubbles
+- spontane kantoor-kat visits met meerdere persoonlijkheden, meow/speech bubbles en routegestuurde wandelingen via meerdere in- en uitgangen
+- klikbare scene-hotspots: het rustbed roept een willekeurige lounge-kat op, de Ops AI monitor roept `Director Whiskers` op
 - fasegestuurde agentstatus in UI (`wacht op input`, `analyseert`, `antwoordt`, `bezig`, `afgerond`, `fout`)
 - custom pixel/manga agent-rendering met statusaccenten voor working/completed/error en werkmodi zoals thinking/typing/reviewing
 - opgeschoonde speech bubbles voor Codex tool-output, zonder terminalruis zoals chunk headers of ANSI kleurcodes
@@ -62,6 +63,7 @@ npm install
    - Command Palette: Pixel Agent: Open Panel
    - Command Palette: Pixel Agent: Emit Test Events
    - Copilot Chat: @pixel /show
+   - klik in het panel op het rustbed of de Ops AI monitor om direct een kantoor-kat spawn te triggeren
 
 ## Scripts
 
@@ -244,6 +246,8 @@ Belangrijkste velden per runtime event:
 - workstation-keuze gebeurt op basis van status + fase + taaktekst (bijv. lint/test/review -> QA, build/tsc/vite -> Engineering)
 - idle agents volgen een lounge-route en doen korte routines zoals pause/dance/sleep, telefoon, zwaaien en plantzorg; het rustbed blijft bezet door maximaal 1 slapende agent tegelijk en settle-momenten houden slaap- en plantanimaties rustiger op hun plek
 - een kantoor-kat kan af en toe de vloer opkomen, rondzwerven, loungen bij vaste spots, miauwen en weer vertrekken; persoonlijkheden variëren van `Stacktrace` tot `Director Whiskers`
+- kantoor-katten gebruiken nu een intern routenetwerk met meerdere entry/exit nodes, scenic detours en vaste lounge-spots, zodat bewegingen minder teleport-achtig en natuurlijker ogen
+- het rustbed en de Ops AI monitor zijn klikbaar in de canvas-scene; bed-click spawnt een willekeurige lounge-kat, monitor-click triggert direct de boss-cat `Director Whiskers`
 - agenten worden als custom pixel/manga karakters gerenderd met visuele statusaccenten zoals speed lines, sparks en error-markers
 - zodra een agent bij een werkplek is aangekomen, wisselt de animatie mee met de taak (`thinking`, `typing`, `reviewing`, `completed`, `error`)
 - speech bubbles en Ops AI-dialogen strippen tooling-metadata zoals `Chunk ID`, `Wall time`, `Process exited with code` en ANSI escape-sequenties voordat tekst in de scene verschijnt

@@ -206,6 +206,13 @@ type OfficeCatPersonalityId =
 interface OfficeCatSpot extends Spot {
   id: string;
   label: string;
+  routeNodeId: string;
+}
+
+interface OfficeCatRouteNode extends Spot {
+  id: string;
+  label: string;
+  neighbors: readonly string[];
 }
 
 interface OfficeCatPersonality {
@@ -248,7 +255,9 @@ interface OfficeCatState {
   actionUntilMs: number;
   nextDecisionAtMs: number;
   nextSpawnAtMs: number;
-  exitSide: "left" | "right";
+  currentNodeId?: string;
+  routeNodeIds: string[];
+  exitNodeId: string;
   meowText: string;
   meowVisibleUntilMs: number;
 }
@@ -857,13 +866,188 @@ const CHAT_SPOTS: readonly Spot[] = [
   { x: roomX(120), y: roomY(138) },
   { x: roomX(160), y: roomY(150) },
 ];
+const OFFICE_CAT_ROUTE_NODES: readonly OfficeCatRouteNode[] = [
+  {
+    id: "entry-left-outside",
+    label: "linker ingang buiten",
+    x: FLOOR_BOUNDS.left - 30,
+    y: roomY(114),
+    neighbors: ["qa-door"],
+  },
+  {
+    id: "entry-top-outside",
+    label: "bovendeur buiten",
+    x: roomX(160),
+    y: roomY(24),
+    neighbors: ["north-arch"],
+  },
+  {
+    id: "entry-right-outside",
+    label: "rechter ingang buiten",
+    x: FLOOR_BOUNDS.right + 30,
+    y: roomY(114),
+    neighbors: ["eng-corner"],
+  },
+  {
+    id: "north-arch",
+    label: "witte boog",
+    x: roomX(160),
+    y: roomY(78),
+    neighbors: ["entry-top-outside", "center-north"],
+  },
+  {
+    id: "center-north",
+    label: "noordpad",
+    x: roomX(160),
+    y: roomY(92),
+    neighbors: ["north-arch", "qa-door", "left-mid", "center-mid", "right-mid", "ops-monitor"],
+  },
+  {
+    id: "center-mid",
+    label: "middenpad",
+    x: roomX(160),
+    y: roomY(118),
+    neighbors: ["center-north", "ops-monitor", "center-lane", "center-south", "left-mid", "right-mid"],
+  },
+  {
+    id: "center-south",
+    label: "zuidpad",
+    x: roomX(160),
+    y: roomY(144),
+    neighbors: ["center-lane", "left-lower", "lounge-rug", "right-lower", "plant-corner"],
+  },
+  {
+    id: "qa-door",
+    label: "qa doorgang",
+    x: roomX(78),
+    y: roomY(112),
+    neighbors: ["entry-left-outside", "center-north", "left-mid"],
+  },
+  {
+    id: "left-mid",
+    label: "linker pad",
+    x: roomX(108),
+    y: roomY(116),
+    neighbors: ["qa-door", "center-north", "center-mid", "left-lower"],
+  },
+  {
+    id: "left-lower",
+    label: "linker loungepad",
+    x: roomX(116),
+    y: roomY(137),
+    neighbors: ["left-mid", "center-south", "lounge-rug"],
+  },
+  {
+    id: "lounge-rug",
+    label: "kleed",
+    x: roomX(126),
+    y: roomY(147),
+    neighbors: ["left-lower", "center-south"],
+  },
+  {
+    id: "ops-monitor",
+    label: "monitor",
+    x: roomX(160),
+    y: roomY(106),
+    neighbors: ["center-north", "center-mid"],
+  },
+  {
+    id: "center-lane",
+    label: "gangpad",
+    x: roomX(158),
+    y: roomY(132),
+    neighbors: ["center-mid", "center-south"],
+  },
+  {
+    id: "right-mid",
+    label: "rechter pad",
+    x: roomX(202),
+    y: roomY(116),
+    neighbors: ["center-north", "center-mid", "eng-corner", "right-lower"],
+  },
+  {
+    id: "right-lower",
+    label: "rechter loungepad",
+    x: roomX(214),
+    y: roomY(138),
+    neighbors: ["right-mid", "eng-corner", "center-south", "plant-corner"],
+  },
+  {
+    id: "eng-corner",
+    label: "engineering",
+    x: roomX(224),
+    y: roomY(115),
+    neighbors: ["entry-right-outside", "right-mid", "right-lower"],
+  },
+  {
+    id: "plant-corner",
+    label: "plant",
+    x: roomX(221),
+    y: roomY(145),
+    neighbors: ["center-south", "right-lower"],
+  },
+];
+const OFFICE_CAT_ROUTE_NODE_BY_ID = new Map(
+  OFFICE_CAT_ROUTE_NODES.map((node) => [node.id, node] as const),
+);
+const OFFICE_CAT_ENTRY_NODE_IDS = [
+  "entry-left-outside",
+  "entry-top-outside",
+  "entry-right-outside",
+] as const;
+const OFFICE_CAT_ROUTE_SCENIC_NODE_IDS = [
+  "north-arch",
+  "center-north",
+  "center-mid",
+  "center-south",
+  "left-mid",
+  "left-lower",
+  "right-mid",
+  "right-lower",
+] as const;
 const OFFICE_CAT_SPOTS: readonly OfficeCatSpot[] = [
-  { id: "lounge-rug", label: "kleed", x: roomX(86), y: roomY(147) },
-  { id: "center-lane", label: "gangpad", x: roomX(156), y: roomY(132) },
-  { id: "ops-monitor", label: "monitor", x: roomX(160), y: roomY(112) },
-  { id: "plant-corner", label: "plant", x: roomX(225), y: roomY(144) },
-  { id: "qa-door", label: "qa", x: roomX(78), y: roomY(112) },
-  { id: "eng-corner", label: "engineering", x: roomX(232), y: roomY(115) },
+  {
+    id: "lounge-rug",
+    label: "kleed",
+    routeNodeId: "lounge-rug",
+    x: roomX(126),
+    y: roomY(147),
+  },
+  {
+    id: "center-lane",
+    label: "gangpad",
+    routeNodeId: "center-lane",
+    x: roomX(158),
+    y: roomY(132),
+  },
+  {
+    id: "ops-monitor",
+    label: "monitor",
+    routeNodeId: "ops-monitor",
+    x: roomX(160),
+    y: roomY(106),
+  },
+  {
+    id: "plant-corner",
+    label: "plant",
+    routeNodeId: "plant-corner",
+    x: roomX(221),
+    y: roomY(145),
+  },
+  {
+    id: "qa-door",
+    label: "qa",
+    routeNodeId: "qa-door",
+    x: roomX(78),
+    y: roomY(112),
+  },
+  {
+    id: "eng-corner",
+    label: "engineering",
+    routeNodeId: "eng-corner",
+    x: roomX(224),
+    y: roomY(115),
+  },
 ];
 const PLANT_CARE_SPOT: IdleSpot = {
   id: "plant-care",
@@ -1222,17 +1406,20 @@ function createDefaultAgent(
 
 function createDefaultOfficeCat(): OfficeCatState {
   const nowMs = performance.now();
-  const floorY = roomY(148);
+  const startNode = OFFICE_CAT_ROUTE_NODE_BY_ID.get("entry-left-outside");
+  if (!startNode) {
+    throw new Error("Missing default office cat entry node.");
+  }
   return {
     active: false,
     personalityId: "default",
     mode: "offstage",
     action: "walk",
     facing: 1,
-    x: FLOOR_BOUNDS.left - 28,
-    y: floorY,
-    targetX: FLOOR_BOUNDS.left - 28,
-    targetY: floorY,
+    x: startNode.x,
+    y: startNode.y,
+    targetX: startNode.x,
+    targetY: startNode.y,
     speed: 0.92,
     frame: 0,
     bob: Math.random() * Math.PI * 2,
@@ -1241,7 +1428,9 @@ function createDefaultOfficeCat(): OfficeCatState {
     actionUntilMs: nowMs,
     nextDecisionAtMs: nowMs,
     nextSpawnAtMs: nowMs + randomRange(OFFICE_CAT_MIN_SPAWN_MS, OFFICE_CAT_MAX_SPAWN_MS),
-    exitSide: "right",
+    currentNodeId: startNode.id,
+    routeNodeIds: [],
+    exitNodeId: "entry-right-outside",
     meowText: "",
     meowVisibleUntilMs: 0,
   };
@@ -1249,6 +1438,25 @@ function createDefaultOfficeCat(): OfficeCatState {
 
 function getOfficeCatPersonality(): OfficeCatPersonality {
   return OFFICE_CAT_PERSONALITIES[officeCat.personalityId];
+}
+
+function getOfficeCatRouteNode(nodeId?: string): OfficeCatRouteNode | undefined {
+  if (!nodeId) {
+    return undefined;
+  }
+  return OFFICE_CAT_ROUTE_NODE_BY_ID.get(nodeId);
+}
+
+function requireOfficeCatRouteNode(nodeId: string): OfficeCatRouteNode {
+  const node = getOfficeCatRouteNode(nodeId);
+  if (!node) {
+    throw new Error(`Unknown office cat route node: ${nodeId}`);
+  }
+  return node;
+}
+
+function getOfficeCatSpotByRouteNodeId(nodeId?: string): OfficeCatSpot | undefined {
+  return OFFICE_CAT_SPOTS.find((spot) => spot.routeNodeId === nodeId);
 }
 
 function pickWeighted<T>(items: ReadonlyArray<readonly [T, number]>): T {
@@ -1293,6 +1501,155 @@ function pickOfficeCatSpot(exceptId?: string): OfficeCatSpot {
   return pickRandom(candidates.length > 0 ? candidates : OFFICE_CAT_SPOTS);
 }
 
+function pickOfficeCatEntryNodeId(personalityId = officeCat.personalityId): string {
+  if (personalityId === "boss-cat") {
+    return pickWeighted<string>([
+      ["entry-top-outside", 52],
+      ["entry-left-outside", 24],
+      ["entry-right-outside", 24],
+    ]);
+  }
+
+  return pickWeighted<string>([
+    ["entry-left-outside", 34],
+    ["entry-top-outside", 32],
+    ["entry-right-outside", 34],
+  ]);
+}
+
+function pickOfficeCatExitNodeId(entryNodeId: string): string {
+  if (Math.random() < 0.4) {
+    return entryNodeId;
+  }
+
+  const alternatives = OFFICE_CAT_ENTRY_NODE_IDS.filter((id) => id !== entryNodeId);
+  if (alternatives.length === 0) {
+    return entryNodeId;
+  }
+  return pickRandom(alternatives);
+}
+
+function findNearestOfficeCatRouteNodeId(): string {
+  return OFFICE_CAT_ROUTE_NODES.slice().sort((left, right) => {
+    const leftDistance = Math.hypot(officeCat.x - left.x, officeCat.y - left.y);
+    const rightDistance = Math.hypot(officeCat.x - right.x, officeCat.y - right.y);
+    return leftDistance - rightDistance;
+  })[0].id;
+}
+
+function buildOfficeCatShortestPath(
+  startNodeId: string,
+  endNodeId: string,
+): string[] {
+  if (startNodeId === endNodeId) {
+    return [startNodeId];
+  }
+
+  const queue = [startNodeId];
+  const visited = new Set<string>([startNodeId]);
+  const previous = new Map<string, string>();
+
+  while (queue.length > 0) {
+    const currentNodeId = queue.shift();
+    if (!currentNodeId) {
+      break;
+    }
+
+    const currentNode = requireOfficeCatRouteNode(currentNodeId);
+    for (const neighborId of currentNode.neighbors) {
+      if (visited.has(neighborId)) {
+        continue;
+      }
+      visited.add(neighborId);
+      previous.set(neighborId, currentNodeId);
+      if (neighborId === endNodeId) {
+        const path = [endNodeId];
+        let cursor = endNodeId;
+        while (previous.has(cursor)) {
+          cursor = previous.get(cursor)!;
+          path.unshift(cursor);
+        }
+        return path;
+      }
+      queue.push(neighborId);
+    }
+  }
+
+  return [startNodeId, endNodeId];
+}
+
+function combineOfficeCatPaths(...paths: string[][]): string[] {
+  const combined: string[] = [];
+  for (const path of paths) {
+    if (path.length === 0) {
+      continue;
+    }
+    if (combined.length === 0) {
+      combined.push(...path);
+    } else {
+      combined.push(...path.slice(1));
+    }
+  }
+  return combined;
+}
+
+function buildOfficeCatRoute(
+  startNodeId: string,
+  endNodeId: string,
+  options?: { allowVariation?: boolean },
+): string[] {
+  const direct = buildOfficeCatShortestPath(startNodeId, endNodeId);
+  if (!options?.allowVariation || direct.length < 3) {
+    return direct;
+  }
+
+  const scenicCandidates = OFFICE_CAT_ROUTE_SCENIC_NODE_IDS.map((viaNodeId) => {
+    if (viaNodeId === startNodeId || viaNodeId === endNodeId) {
+      return undefined;
+    }
+    const firstLeg = buildOfficeCatShortestPath(startNodeId, viaNodeId);
+    const secondLeg = buildOfficeCatShortestPath(viaNodeId, endNodeId);
+    const scenic = combineOfficeCatPaths(firstLeg, secondLeg);
+    if (scenic.length <= direct.length || scenic.length > direct.length + 4) {
+      return undefined;
+    }
+    return scenic;
+  }).filter((path): path is string[] => Boolean(path));
+
+  if (scenicCandidates.length > 0 && Math.random() < 0.46) {
+    return pickRandom(scenicCandidates);
+  }
+
+  return direct;
+}
+
+function advanceOfficeCatRoute(): boolean {
+  const nextNodeId = officeCat.routeNodeIds.shift();
+  if (!nextNodeId) {
+    return false;
+  }
+
+  const nextNode = requireOfficeCatRouteNode(nextNodeId);
+  officeCat.currentNodeId = nextNodeId;
+  setOfficeCatTarget(nextNode);
+  return true;
+}
+
+function routeOfficeCatToNode(
+  targetNodeId: string,
+  options?: { allowVariation?: boolean },
+) {
+  const startNodeId =
+    officeCat.currentNodeId ?? findNearestOfficeCatRouteNodeId();
+  const path = buildOfficeCatRoute(startNodeId, targetNodeId, options);
+  officeCat.routeNodeIds = path.slice(1);
+  if (!advanceOfficeCatRoute()) {
+    const targetNode = requireOfficeCatRouteNode(targetNodeId);
+    officeCat.currentNodeId = targetNodeId;
+    setOfficeCatTarget(targetNode);
+  }
+}
+
 function setOfficeCatMeow(text: string, nowMs: number, durationMs?: number) {
   officeCat.meowText = text;
   officeCat.meowVisibleUntilMs =
@@ -1331,11 +1688,14 @@ function scheduleOfficeCatDeparture(nowMs: number) {
   officeCat.mode = "leaving";
   officeCat.action = "walk";
   officeCat.speed = personality.speedMin + 0.18 + Math.random() * 0.28;
-  const offscreenX =
-    officeCat.exitSide === "left"
-      ? FLOOR_BOUNDS.left - 30
-      : FLOOR_BOUNDS.right + 30;
-  setOfficeCatTarget({ x: offscreenX, y: officeCat.y });
+  if (!officeCat.exitNodeId) {
+    officeCat.exitNodeId = pickOfficeCatExitNodeId(
+      officeCat.currentNodeId ?? "entry-right-outside",
+    );
+  }
+  routeOfficeCatToNode(officeCat.exitNodeId, {
+    allowVariation: Math.random() < 0.28,
+  });
   if (Math.random() < 0.42) {
     setOfficeCatMeow(pickOfficeCatMeow(["*verdwijnt*", "*staart omhoog*"]), nowMs);
   }
@@ -1376,15 +1736,22 @@ function startOfficeCatAction(nowMs: number, action: OfficeCatAction) {
   }
 }
 
-function spawnOfficeCat(nowMs: number) {
-  officeCat.personalityId = pickOfficeCatPersonalityId();
+function spawnOfficeCat(
+  nowMs: number,
+  options?: { personalityId?: OfficeCatPersonalityId; entryNodeId?: string },
+) {
+  officeCat.personalityId = options?.personalityId ?? pickOfficeCatPersonalityId();
   const personality = getOfficeCatPersonality();
-  const side = Math.random() < 0.5 ? "left" : "right";
   const firstSpot = pickOfficeCatSpot();
+  const entryNodeId =
+    options?.entryNodeId ?? pickOfficeCatEntryNodeId(officeCat.personalityId);
+  const entryNode = requireOfficeCatRouteNode(entryNodeId);
   officeCat.active = true;
   officeCat.mode = "entering";
   officeCat.action = "walk";
-  officeCat.exitSide = Math.random() < 0.6 ? side : side === "left" ? "right" : "left";
+  officeCat.currentNodeId = entryNodeId;
+  officeCat.routeNodeIds = [];
+  officeCat.exitNodeId = pickOfficeCatExitNodeId(entryNodeId);
   officeCat.enteredAtMs = nowMs;
   officeCat.departureAtMs =
     nowMs +
@@ -1397,9 +1764,12 @@ function spawnOfficeCat(nowMs: number) {
     Math.random() * Math.max(0.1, personality.speedMax - personality.speedMin);
   officeCat.frame = 0;
   officeCat.bob = Math.random() * Math.PI * 2;
-  officeCat.x = side === "left" ? FLOOR_BOUNDS.left - 30 : FLOOR_BOUNDS.right + 30;
-  officeCat.y = firstSpot.y + randomRange(-4, 4);
-  officeCat.facing = side === "left" ? 1 : -1;
+  officeCat.x = entryNode.x;
+  officeCat.y = entryNode.y;
+  officeCat.targetX = entryNode.x;
+  officeCat.targetY = entryNode.y;
+  officeCat.facing =
+    entryNode.x < roomX(160) ? 1 : entryNode.x > roomX(160) ? -1 : 1;
   clearOfficeCatMeow();
   if (Math.random() < 0.45) {
     setOfficeCatMeow(
@@ -1408,7 +1778,9 @@ function spawnOfficeCat(nowMs: number) {
       2200,
     );
   }
-  setOfficeCatTarget(firstSpot);
+  routeOfficeCatToNode(firstSpot.routeNodeId, {
+    allowVariation: Math.random() < 0.62,
+  });
 
   const epochNow = Date.now();
   if (
@@ -1438,7 +1810,8 @@ function chooseNextOfficeCatBeat(nowMs: number) {
     return;
   }
 
-  const nextSpot = pickOfficeCatSpot();
+  const currentSpot = getOfficeCatSpotByRouteNodeId(officeCat.currentNodeId);
+  const nextSpot = pickOfficeCatSpot(currentSpot?.id);
   const shouldZoom = Math.random() < personality.zoomChance;
   officeCat.mode = "wandering";
   officeCat.action = shouldZoom ? "zoom" : "walk";
@@ -1446,9 +1819,8 @@ function chooseNextOfficeCatBeat(nowMs: number) {
     ? personality.speedMax + 0.4 + Math.random() * 0.35
     : personality.speedMin + 0.12 + Math.random() * 0.24;
   officeCat.nextDecisionAtMs = nowMs + randomRange(2200, 4600);
-  setOfficeCatTarget({
-    x: nextSpot.x + randomRange(-5, 5),
-    y: nextSpot.y + randomRange(-4, 4),
+  routeOfficeCatToNode(nextSpot.routeNodeId, {
+    allowVariation: true,
   });
 
   if (shouldZoom) {
@@ -3432,6 +3804,59 @@ function getBossMonitorRect(backgroundScene: boolean) {
   return { x: 18, y: 18, width: 58, height: 38 };
 }
 
+function getBedRect(backgroundScene: boolean): BubbleBox {
+  if (backgroundScene) {
+    return {
+      x: BED_SPOT.x - 34,
+      y: BED_SPOT.y - 20,
+      width: 70,
+      height: 26,
+    };
+  }
+
+  return {
+    x: 58,
+    y: 131,
+    width: 56,
+    height: 22,
+  };
+}
+
+function containsPoint(rect: BubbleBox, point: Spot): boolean {
+  return (
+    point.x >= rect.x &&
+    point.x <= rect.x + rect.width &&
+    point.y >= rect.y &&
+    point.y <= rect.y + rect.height
+  );
+}
+
+function getCanvasPointerPosition(event: MouseEvent): Spot {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((event.clientX - rect.left) / rect.width) * canvas.width,
+    y: ((event.clientY - rect.top) / rect.height) * canvas.height,
+  };
+}
+
+function pickBedCatPersonalityId(): OfficeCatPersonalityId {
+  return pickWeighted<OfficeCatPersonalityId>([
+    ["default", 44],
+    ["chaos-goblin", 30],
+    ["senior-office-cat", 26],
+  ]);
+}
+
+function triggerOfficeCatSpawn(personalityId: OfficeCatPersonalityId) {
+  const nowMs = performance.now();
+  const entryNodeId =
+    personalityId === "boss-cat"
+      ? "entry-top-outside"
+      : pickOfficeCatEntryNodeId(personalityId);
+  spawnOfficeCat(nowMs, { personalityId, entryNodeId });
+  nextBossIdleAt = Math.min(nextBossIdleAt, Date.now() + 1200);
+}
+
 function drawBossHeadSprite(
   x: number,
   y: number,
@@ -4832,30 +5257,42 @@ function tickOfficeCat(nowMs: number) {
 
   officeCat.frame += shouldMove ? 1 : officeCat.action === "nap" ? 0.08 : 0.24;
 
-  if (officeCat.mode === "entering" && distance < 1.8) {
-    startOfficeCatAction(nowMs, pickOfficeCatLoungeAction());
-  } else if (officeCat.mode === "wandering" && distance < 1.8) {
-    startOfficeCatAction(nowMs, pickOfficeCatLoungeAction());
-  } else if (officeCat.mode === "lounging" && nowMs >= officeCat.nextDecisionAtMs) {
-    chooseNextOfficeCatBeat(nowMs);
-  } else if (officeCat.mode === "leaving") {
-    const hasExited =
-      (officeCat.exitSide === "left" && officeCat.x <= FLOOR_BOUNDS.left - 24) ||
-      (officeCat.exitSide === "right" && officeCat.x >= FLOOR_BOUNDS.right + 24);
-    if (hasExited) {
+  if (distance < 1.8) {
+    officeCat.x = officeCat.targetX;
+    officeCat.y = officeCat.targetY;
+    if (advanceOfficeCatRoute()) {
+      return;
+    }
+    if (officeCat.mode === "entering" || officeCat.mode === "wandering") {
+      startOfficeCatAction(nowMs, pickOfficeCatLoungeAction());
+      return;
+    }
+    if (officeCat.mode === "leaving") {
       officeCat.active = false;
       officeCat.mode = "offstage";
       officeCat.action = "walk";
+      officeCat.routeNodeIds = [];
       clearOfficeCatMeow();
       officeCat.nextSpawnAtMs =
         nowMs + randomRange(OFFICE_CAT_MIN_SPAWN_MS, OFFICE_CAT_MAX_SPAWN_MS);
+      return;
     }
+  }
+
+  if (officeCat.mode === "lounging" && nowMs >= officeCat.nextDecisionAtMs) {
+    chooseNextOfficeCatBeat(nowMs);
   }
 
   if (officeCat.mode !== "leaving") {
     officeCat.x = clamp(officeCat.x, FLOOR_BOUNDS.left - 32, FLOOR_BOUNDS.right + 32);
   }
-  officeCat.y = clamp(officeCat.y, FLOOR_BOUNDS.top + 18, FLOOR_BOUNDS.bottom + 3);
+  officeCat.y = clamp(
+    officeCat.y,
+    officeCat.mode === "entering" || officeCat.mode === "leaving"
+      ? roomY(18)
+      : FLOOR_BOUNDS.top + 18,
+    FLOOR_BOUNDS.bottom + 3,
+  );
 }
 
 function buildSpeechLayout(
@@ -5164,6 +5601,29 @@ window.addEventListener(
 
 refreshButton?.addEventListener("click", () => {
   vscode.postMessage({ type: "webview-request-snapshot" });
+});
+
+canvas.addEventListener("mousemove", (event) => {
+  const point = getCanvasPointerPosition(event);
+  const backgroundScene = Boolean(roomBackgroundImage);
+  const interactive =
+    containsPoint(getBedRect(backgroundScene), point) ||
+    containsPoint(getBossMonitorRect(backgroundScene), point);
+  canvas.style.cursor = interactive ? "pointer" : "default";
+});
+
+canvas.addEventListener("click", (event) => {
+  const point = getCanvasPointerPosition(event);
+  const backgroundScene = Boolean(roomBackgroundImage);
+
+  if (containsPoint(getBedRect(backgroundScene), point)) {
+    triggerOfficeCatSpawn(pickBedCatPersonalityId());
+    return;
+  }
+
+  if (containsPoint(getBossMonitorRect(backgroundScene), point)) {
+    triggerOfficeCatSpawn("boss-cat");
+  }
 });
 
 setInterval(() => {

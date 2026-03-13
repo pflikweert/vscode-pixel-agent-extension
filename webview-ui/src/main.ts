@@ -190,6 +190,69 @@ interface BossMonitorState {
   targetAgentId?: AgentId;
 }
 
+type OfficeCatMode =
+  | "offstage"
+  | "entering"
+  | "wandering"
+  | "lounging"
+  | "leaving";
+type OfficeCatAction = "walk" | "sit" | "loaf" | "groom" | "zoom" | "nap";
+type OfficeCatPersonalityId =
+  | "default"
+  | "chaos-goblin"
+  | "senior-office-cat"
+  | "boss-cat";
+
+interface OfficeCatSpot extends Spot {
+  id: string;
+  label: string;
+}
+
+interface OfficeCatPersonality {
+  id: OfficeCatPersonalityId;
+  name: string;
+  bossLabel: string;
+  personalityLabel: string;
+  fur: string;
+  furShade: string;
+  outline: string;
+  ear: string;
+  eye: string;
+  nose: string;
+  shadow: string;
+  speedMin: number;
+  speedMax: number;
+  zoomChance: number;
+  immediateBossChance: number;
+  stayMultiplier: number;
+  preferredSpotIds: readonly string[];
+  meows: readonly string[];
+  actionWeights: ReadonlyArray<readonly [OfficeCatAction, number]>;
+}
+
+interface OfficeCatState {
+  active: boolean;
+  personalityId: OfficeCatPersonalityId;
+  mode: OfficeCatMode;
+  action: OfficeCatAction;
+  facing: 1 | -1;
+  x: number;
+  y: number;
+  targetX: number;
+  targetY: number;
+  speed: number;
+  frame: number;
+  bob: number;
+  enteredAtMs: number;
+  departureAtMs: number;
+  actionUntilMs: number;
+  nextDecisionAtMs: number;
+  nextSpawnAtMs: number;
+  exitSide: "left" | "right";
+  meowText: string;
+  meowVisibleUntilMs: number;
+}
+
 type ExtensionMessage =
   | { type: "pixel.snapshot"; payload: RuntimeState }
   | { type: "pixel.event"; payload: PixelRuntimeEvent };
@@ -227,6 +290,12 @@ const DEFAULT_SPRITE_ROWS = 4;
 const GRID_TRIM_DISTANCE = 24;
 const GRID_TRIM_MIN_PIXELS = 340;
 const GRID_TRIM_PADDING = 4;
+const OFFICE_CAT_MIN_SPAWN_MS = 18_000;
+const OFFICE_CAT_MAX_SPAWN_MS = 46_000;
+const OFFICE_CAT_MIN_STAY_MS = 8_500;
+const OFFICE_CAT_MAX_STAY_MS = 21_000;
+const OFFICE_CAT_MEOW_BASE_MS = 1_400;
+const OFFICE_CAT_MEOW_MAX_MS = 4_800;
 
 interface IdleJoke {
   setup: string;
@@ -241,6 +310,164 @@ const OPS_AI_IDLE_LINES = [
   "vrm... patchweer gedetecteerd in kwadrant engineering.",
   "bz-bzzt... alle pixels paraat. koffie-subroutine ontbreekt.",
 ];
+
+const OPS_AI_DIRTY_GIT_IDLE_LINES = [
+  "war room bulletin: {changes} op {branch}. diff-loopgraven bemand.",
+  "krrt... {changes} gezien op {branch}. wie noemde dit een kleine patch?",
+  "frontbericht: {changes}. eerst formatteren, dan de veldslag.",
+  "stil in de lounge, rumoer in git: {changes}. klassieke hinderlaag.",
+  "ik ruik {changes} op {branch}. de commit-linie lacht nerveus.",
+];
+
+const OPS_AI_DIRTY_GIT_ALL_IDLE_LINES = [
+  "alle agents idle, maar {changes} liggen nog in de loopgraven.",
+  "de vloer is rustig, het front niet: {changes} op {branch}.",
+  "iedereen loungt terwijl {changes} guerrilla speelt in git.",
+  "war room update: alle squads rusten, maar {changes} wachten nog.",
+  "grap van de dag: 'kleine wijziging'. realiteit: {changes}.",
+];
+
+const OPS_AI_CAT_IDLE_LINES = [
+  "sensor ping: {catName} draait in {catAction}. morale-build groen.",
+  "mrr-module actief. {catName} runt nu {catAction} in {catSpot}.",
+  "ops update: {catName} voert een stealth-audit uit bij {catSpot}.",
+  "ik zie snorharen op de bus: {catName} in {catAction}. waarschijnlijk feature-complete.",
+  "war room notitie: {catName} heeft opnieuw ownership gepakt over {catSpot}.",
+  "nerd alert: {catPersona}. purrformance stabiel in {catAction}.",
+  "{catName} test de latency van het tapijt. benchmark: volledig subjectief.",
+  "feline kernel notice: {catName} claimt {catSpot} als write-access zone.",
+];
+
+const OPS_AI_BOSS_CAT_IDLE_LINES = [
+  "executive override: {catName} heeft de sprint review zonder uitnodiging geopend.",
+  "{catName} inspecteert {catSpot}. iedereen gedraagt zich alsof dit gepland was.",
+  "board update: {catName} draait in {catAction}. roadmap nu 14% hariger.",
+  "{catName} heeft ownership geclaimd over de lounge. approvals verlopen via pootafdruk.",
+  "priority alert: executive feline op de vloer. alle squads doen alsof zij geen toetsenbord delen.",
+];
+
+const OFFICE_CAT_MEOWS = [
+  "mrrp",
+  "prrt",
+  "miauw",
+  "*staar*",
+  "*zoom*",
+  "*snif*",
+  "*plof*",
+];
+
+const OFFICE_CAT_PERSONALITIES: Record<
+  OfficeCatPersonalityId,
+  OfficeCatPersonality
+> = {
+  default: {
+    id: "default",
+    name: "Monitor Minoes",
+    bossLabel: "Monitor Minoes",
+    personalityLabel: "huisdier daemon",
+    fur: "#d9dde9",
+    furShade: "#b3bbd0",
+    outline: "#2d3347",
+    ear: "#f4b7cf",
+    eye: "#fbfcff",
+    nose: "#f29ebe",
+    shadow: "rgba(70, 85, 110, 0.25)",
+    speedMin: 1.04,
+    speedMax: 1.26,
+    zoomChance: 0.18,
+    immediateBossChance: 0.38,
+    stayMultiplier: 1,
+    preferredSpotIds: ["ops-monitor", "center-lane", "lounge-rug"],
+    meows: ["mrrp", "prrt", "*snif*", "*staar*"],
+    actionWeights: [
+      ["sit", 26],
+      ["loaf", 25],
+      ["groom", 25],
+      ["nap", 24],
+    ],
+  },
+  "chaos-goblin": {
+    id: "chaos-goblin",
+    name: "Stacktrace",
+    bossLabel: "Stacktrace",
+    personalityLabel: "chaos goblin met root access",
+    fur: "#f1a764",
+    furShade: "#cd6e3a",
+    outline: "#40251d",
+    ear: "#ffd2c0",
+    eye: "#fff8d8",
+    nose: "#ffb38f",
+    shadow: "rgba(120, 70, 40, 0.3)",
+    speedMin: 1.22,
+    speedMax: 1.58,
+    zoomChance: 0.46,
+    immediateBossChance: 0.54,
+    stayMultiplier: 0.92,
+    preferredSpotIds: ["eng-corner", "qa-door", "ops-monitor"],
+    meows: ["*skrrt*", "nyoom", "mrrROW", "*chaos*", "*toetsenbord?*"],
+    actionWeights: [
+      ["zoom", 34],
+      ["groom", 18],
+      ["sit", 16],
+      ["loaf", 12],
+      ["nap", 20],
+    ],
+  },
+  "senior-office-cat": {
+    id: "senior-office-cat",
+    name: "Oom Buffer",
+    bossLabel: "Oom Buffer",
+    personalityLabel: "senior office cat met legacy privileges",
+    fur: "#c9ceda",
+    furShade: "#8f9aad",
+    outline: "#334056",
+    ear: "#efc9d7",
+    eye: "#fefefe",
+    nose: "#e5a5bd",
+    shadow: "rgba(60, 74, 102, 0.28)",
+    speedMin: 0.78,
+    speedMax: 0.96,
+    zoomChance: 0.05,
+    immediateBossChance: 0.31,
+    stayMultiplier: 1.42,
+    preferredSpotIds: ["lounge-rug", "plant-corner", "center-lane"],
+    meows: ["mrrf", "*plof*", "*zucht als een architect*", "prr...", "*dutje*"],
+    actionWeights: [
+      ["nap", 38],
+      ["loaf", 31],
+      ["sit", 15],
+      ["groom", 12],
+      ["zoom", 4],
+    ],
+  },
+  "boss-cat": {
+    id: "boss-cat",
+    name: "Director Whiskers",
+    bossLabel: "Director Whiskers",
+    personalityLabel: "executive feline met production access",
+    fur: "#f2e1a8",
+    furShade: "#c6a65a",
+    outline: "#4a3720",
+    ear: "#f6cdb6",
+    eye: "#fff7cf",
+    nose: "#e7a47b",
+    shadow: "rgba(120, 92, 40, 0.34)",
+    speedMin: 0.9,
+    speedMax: 1.12,
+    zoomChance: 0.08,
+    immediateBossChance: 0.82,
+    stayMultiplier: 1.18,
+    preferredSpotIds: ["ops-monitor", "center-lane", "plant-corner"],
+    meows: ["mrrrow", "*board meeting*", "*keurend knikje*", "prrrt"],
+    actionWeights: [
+      ["sit", 28],
+      ["loaf", 24],
+      ["groom", 16],
+      ["nap", 28],
+      ["zoom", 4],
+    ],
+  },
+};
 
 const IDLE_JOKES: IdleJoke[] = [
   {
@@ -630,6 +857,14 @@ const CHAT_SPOTS: readonly Spot[] = [
   { x: roomX(120), y: roomY(138) },
   { x: roomX(160), y: roomY(150) },
 ];
+const OFFICE_CAT_SPOTS: readonly OfficeCatSpot[] = [
+  { id: "lounge-rug", label: "kleed", x: roomX(86), y: roomY(147) },
+  { id: "center-lane", label: "gangpad", x: roomX(156), y: roomY(132) },
+  { id: "ops-monitor", label: "monitor", x: roomX(160), y: roomY(112) },
+  { id: "plant-corner", label: "plant", x: roomX(225), y: roomY(144) },
+  { id: "qa-door", label: "qa", x: roomX(78), y: roomY(112) },
+  { id: "eng-corner", label: "engineering", x: roomX(232), y: roomY(115) },
+];
 const PLANT_CARE_SPOT: IdleSpot = {
   id: "plant-care",
   label: "planthoek",
@@ -799,6 +1034,7 @@ const agentIdleOverlays: Record<AgentId, AgentIdleOverlay | null> = {
   builder: null,
   reviewer: null,
 };
+const officeCat: OfficeCatState = createDefaultOfficeCat();
 
 function maybeTriggerIdleOverlay(now: number) {
   for (const id of agentOrder) {
@@ -834,14 +1070,15 @@ function maybeTriggerIdleOverlay(now: number) {
         ) {
           const actionDuration =
             action.routine === "water-plant"
-              ? randomRange(2200, 4200)
+              ? randomRange(3600, 6200)
               : randomRange(1200, 2600);
           agentIdleOverlays[id] = {
             icon: action.icon,
             until: now + actionDuration,
             action: action.routine,
           };
-          agent.routine = "pause";
+          agent.routine =
+            action.routine === "water-plant" ? "normal" : "pause";
           agent.routineUntilMs = now + actionDuration;
           agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2400);
           applyZoneFromStatus(agent);
@@ -983,6 +1220,250 @@ function createDefaultAgent(
   };
 }
 
+function createDefaultOfficeCat(): OfficeCatState {
+  const nowMs = performance.now();
+  const floorY = roomY(148);
+  return {
+    active: false,
+    personalityId: "default",
+    mode: "offstage",
+    action: "walk",
+    facing: 1,
+    x: FLOOR_BOUNDS.left - 28,
+    y: floorY,
+    targetX: FLOOR_BOUNDS.left - 28,
+    targetY: floorY,
+    speed: 0.92,
+    frame: 0,
+    bob: Math.random() * Math.PI * 2,
+    enteredAtMs: 0,
+    departureAtMs: nowMs,
+    actionUntilMs: nowMs,
+    nextDecisionAtMs: nowMs,
+    nextSpawnAtMs: nowMs + randomRange(OFFICE_CAT_MIN_SPAWN_MS, OFFICE_CAT_MAX_SPAWN_MS),
+    exitSide: "right",
+    meowText: "",
+    meowVisibleUntilMs: 0,
+  };
+}
+
+function getOfficeCatPersonality(): OfficeCatPersonality {
+  return OFFICE_CAT_PERSONALITIES[officeCat.personalityId];
+}
+
+function pickWeighted<T>(items: ReadonlyArray<readonly [T, number]>): T {
+  const total = items.reduce((sum, [, weight]) => sum + Math.max(0, weight), 0);
+  if (total <= 0) {
+    return items[0][0];
+  }
+
+  let roll = Math.random() * total;
+  for (const [item, weight] of items) {
+    roll -= Math.max(0, weight);
+    if (roll <= 0) {
+      return item;
+    }
+  }
+
+  return items[items.length - 1][0];
+}
+
+function pickOfficeCatPersonalityId(): OfficeCatPersonalityId {
+  if (Math.random() < 0.05) {
+    return "boss-cat";
+  }
+
+  return pickWeighted<OfficeCatPersonalityId>([
+    ["default", 48],
+    ["chaos-goblin", 29],
+    ["senior-office-cat", 23],
+  ]);
+}
+
+function pickOfficeCatSpot(exceptId?: string): OfficeCatSpot {
+  const personality = getOfficeCatPersonality();
+  const preferred = OFFICE_CAT_SPOTS.filter(
+    (spot) =>
+      spot.id !== exceptId && personality.preferredSpotIds.includes(spot.id),
+  );
+  const candidates = OFFICE_CAT_SPOTS.filter((spot) => spot.id !== exceptId);
+  if (preferred.length > 0 && Math.random() < 0.72) {
+    return pickRandom(preferred);
+  }
+  return pickRandom(candidates.length > 0 ? candidates : OFFICE_CAT_SPOTS);
+}
+
+function setOfficeCatMeow(text: string, nowMs: number, durationMs?: number) {
+  officeCat.meowText = text;
+  officeCat.meowVisibleUntilMs =
+    nowMs +
+    (durationMs ||
+      clamp(
+        OFFICE_CAT_MEOW_BASE_MS + text.length * 160,
+        OFFICE_CAT_MEOW_BASE_MS,
+        OFFICE_CAT_MEOW_MAX_MS,
+      ));
+}
+
+function clearOfficeCatMeow() {
+  officeCat.meowText = "";
+  officeCat.meowVisibleUntilMs = 0;
+}
+
+function pickOfficeCatMeow(extra?: readonly string[]): string {
+  const personality = getOfficeCatPersonality();
+  const base = OFFICE_CAT_MEOWS.concat(personality.meows);
+  const pool = extra ? base.concat(extra) : base;
+  return pickRandom(pool);
+}
+
+function setOfficeCatTarget(target: Spot) {
+  officeCat.targetX = target.x;
+  officeCat.targetY = target.y;
+  const dx = officeCat.targetX - officeCat.x;
+  if (Math.abs(dx) > 0.2) {
+    officeCat.facing = dx >= 0 ? 1 : -1;
+  }
+}
+
+function scheduleOfficeCatDeparture(nowMs: number) {
+  const personality = getOfficeCatPersonality();
+  officeCat.mode = "leaving";
+  officeCat.action = "walk";
+  officeCat.speed = personality.speedMin + 0.18 + Math.random() * 0.28;
+  const offscreenX =
+    officeCat.exitSide === "left"
+      ? FLOOR_BOUNDS.left - 30
+      : FLOOR_BOUNDS.right + 30;
+  setOfficeCatTarget({ x: offscreenX, y: officeCat.y });
+  if (Math.random() < 0.42) {
+    setOfficeCatMeow(pickOfficeCatMeow(["*verdwijnt*", "*staart omhoog*"]), nowMs);
+  }
+}
+
+function startOfficeCatAction(nowMs: number, action: OfficeCatAction) {
+  const personality = getOfficeCatPersonality();
+  officeCat.mode = "lounging";
+  officeCat.action = action;
+
+  const duration =
+    action === "zoom"
+      ? randomRange(1200, 2400)
+      : action === "nap"
+        ? randomRange(2600, 5200)
+        : randomRange(1800, 4200);
+  officeCat.actionUntilMs = nowMs + duration;
+  officeCat.nextDecisionAtMs = officeCat.actionUntilMs + randomRange(900, 2400);
+  officeCat.speed =
+    action === "zoom"
+      ? personality.speedMax + 0.34 + Math.random() * 0.32
+      : personality.speedMin + Math.random() * 0.2;
+
+  if (Math.random() < 0.8) {
+    const chatter =
+      action === "sit"
+        ? pickOfficeCatMeow(["*zit*", "*kijkt streng*"])
+        : action === "loaf"
+          ? pickOfficeCatMeow(["*plof*", "*broodmodus*"])
+          : action === "groom"
+            ? pickOfficeCatMeow(["*lik lik*", "*poets*"])
+            : action === "zoom"
+              ? pickOfficeCatMeow(["*zoom*", "nyoom", "*skrrt*"])
+              : pickOfficeCatMeow(["z", "zz", "*dutje*"]);
+    setOfficeCatMeow(chatter, nowMs);
+  } else {
+    clearOfficeCatMeow();
+  }
+}
+
+function spawnOfficeCat(nowMs: number) {
+  officeCat.personalityId = pickOfficeCatPersonalityId();
+  const personality = getOfficeCatPersonality();
+  const side = Math.random() < 0.5 ? "left" : "right";
+  const firstSpot = pickOfficeCatSpot();
+  officeCat.active = true;
+  officeCat.mode = "entering";
+  officeCat.action = "walk";
+  officeCat.exitSide = Math.random() < 0.6 ? side : side === "left" ? "right" : "left";
+  officeCat.enteredAtMs = nowMs;
+  officeCat.departureAtMs =
+    nowMs +
+    randomRange(OFFICE_CAT_MIN_STAY_MS, OFFICE_CAT_MAX_STAY_MS) *
+      personality.stayMultiplier;
+  officeCat.actionUntilMs = nowMs + randomRange(1400, 2600);
+  officeCat.nextDecisionAtMs = nowMs + randomRange(1800, 3600);
+  officeCat.speed =
+    personality.speedMin +
+    Math.random() * Math.max(0.1, personality.speedMax - personality.speedMin);
+  officeCat.frame = 0;
+  officeCat.bob = Math.random() * Math.PI * 2;
+  officeCat.x = side === "left" ? FLOOR_BOUNDS.left - 30 : FLOOR_BOUNDS.right + 30;
+  officeCat.y = firstSpot.y + randomRange(-4, 4);
+  officeCat.facing = side === "left" ? 1 : -1;
+  clearOfficeCatMeow();
+  if (Math.random() < 0.45) {
+    setOfficeCatMeow(
+      pickOfficeCatMeow(["*sluipt binnen*", "miauw"]),
+      nowMs,
+      2200,
+    );
+  }
+  setOfficeCatTarget(firstSpot);
+
+  const epochNow = Date.now();
+  if (
+    bossMonitorState.mode === "idle" &&
+    !isBossSpeechVisible(epochNow) &&
+    Math.random() < personality.immediateBossChance
+  ) {
+    setBossSpeechText(
+      fillBossCatTemplate(pickRandom(OPS_AI_CAT_IDLE_LINES)),
+      epochNow,
+      "idle",
+    );
+  } else {
+    nextBossIdleAt = Math.min(nextBossIdleAt, epochNow + 1600);
+  }
+}
+
+function officeCatDistanceToTarget(): number {
+  return Math.hypot(officeCat.targetX - officeCat.x, officeCat.targetY - officeCat.y);
+}
+
+function chooseNextOfficeCatBeat(nowMs: number) {
+  const personality = getOfficeCatPersonality();
+  const stayExceeded = nowMs >= officeCat.departureAtMs;
+  if (stayExceeded && Math.random() < 0.68) {
+    scheduleOfficeCatDeparture(nowMs);
+    return;
+  }
+
+  const nextSpot = pickOfficeCatSpot();
+  const shouldZoom = Math.random() < personality.zoomChance;
+  officeCat.mode = "wandering";
+  officeCat.action = shouldZoom ? "zoom" : "walk";
+  officeCat.speed = shouldZoom
+    ? personality.speedMax + 0.4 + Math.random() * 0.35
+    : personality.speedMin + 0.12 + Math.random() * 0.24;
+  officeCat.nextDecisionAtMs = nowMs + randomRange(2200, 4600);
+  setOfficeCatTarget({
+    x: nextSpot.x + randomRange(-5, 5),
+    y: nextSpot.y + randomRange(-4, 4),
+  });
+
+  if (shouldZoom) {
+    setOfficeCatMeow(pickOfficeCatMeow(["*zoom*", "nyoom"]), nowMs, 1800);
+  } else if (Math.random() < 0.22) {
+    setOfficeCatMeow(pickOfficeCatMeow(["*snif*", "*staar*"]), nowMs, 1800);
+  } else {
+    clearOfficeCatMeow();
+  }
+}
+
+function pickOfficeCatLoungeAction(): OfficeCatAction {
+  return pickWeighted(getOfficeCatPersonality().actionWeights);
+}
+
 function shorten(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
     return value;
@@ -1093,6 +1574,33 @@ function getIdleSpotById(spotId?: string): IdleSpot | undefined {
     return PLANT_CARE_SPOT;
   }
   return IDLE_SPOT_BY_ID.get(spotId);
+}
+
+function distanceToTarget(agent: AgentVisualState): number {
+  return Math.hypot(agent.targetX - agent.x, agent.targetY - agent.y);
+}
+
+function isSettledAtIdleSpot(
+  agent: AgentVisualState,
+  spot: IdleSpot,
+  tolerance = 4.2,
+): boolean {
+  return agent.idleSpotId === spot.id && distanceToTarget(agent) < tolerance;
+}
+
+function isPlantWateringSettled(agent: AgentVisualState): boolean {
+  return (
+    agentIdleOverlays[agent.id]?.action === "water-plant" &&
+    isSettledAtIdleSpot(agent, PLANT_CARE_SPOT)
+  );
+}
+
+function isSleepSettled(agent: AgentVisualState): boolean {
+  return (
+    agent.status === "idle" &&
+    agent.routine === "sleep" &&
+    isSettledAtIdleSpot(agent, BED_SPOT)
+  );
 }
 
 function assignIdleTarget(
@@ -1949,7 +2457,7 @@ function chooseNextIdleRoutine(agent: AgentVisualState, nowMs: number) {
   } else if (routine === "dance") {
     agent.routineUntilMs = nowMs + randomRange(1800, 3600);
   } else if (routine === "sleep") {
-    agent.routineUntilMs = nowMs + randomRange(2000, 3900);
+    agent.routineUntilMs = nowMs + randomRange(3800, 6200);
   } else {
     agent.routineUntilMs = nowMs + randomRange(1700, 3200);
   }
@@ -2034,7 +2542,100 @@ function maybeRunBossIdleChatter() {
     return;
   }
 
-  setBossSpeechText(pickRandom(OPS_AI_IDLE_LINES), now, "idle");
+  setBossSpeechText(pickBossIdleLine(), now, "idle");
+}
+
+function areAllAgentsIdle(): boolean {
+  return agentOrder.every((agentId) => agentState[agentId].status === "idle");
+}
+
+function summarizeDirtyGitState(git: GitViewState): string {
+  const parts: string[] = [];
+  if (git.staged > 0) {
+    parts.push(`${git.staged} staged`);
+  }
+  if (git.unstaged > 0) {
+    parts.push(`${git.unstaged} unstaged`);
+  }
+  if (git.conflicts > 0) {
+    parts.push(`${git.conflicts} conflict${git.conflicts === 1 ? "" : "s"}`);
+  }
+
+  const summary =
+    parts.length > 0 ? parts.join(", ") : git.message || "lokale wijzigingen";
+  return shorten(summary, 28);
+}
+
+function fillBossIdleTemplate(template: string, git: GitViewState): string {
+  return template
+    .replace(/\{changes\}/g, summarizeDirtyGitState(git))
+    .replace(/\{branch\}/g, shorten(git.branch || "detached", 16));
+}
+
+function describeOfficeCatAction(action: OfficeCatAction): string {
+  if (action === "sit") {
+    return "sit-mode";
+  }
+  if (action === "loaf") {
+    return "loaf-mode";
+  }
+  if (action === "groom") {
+    return "self-cleanup";
+  }
+  if (action === "zoom") {
+    return "zoomies";
+  }
+  if (action === "nap") {
+    return "slaapstand";
+  }
+  return "patrol";
+}
+
+function describeOfficeCatPersona(): string {
+  return getOfficeCatPersonality().personalityLabel;
+}
+
+function findNearestOfficeCatSpot(): OfficeCatSpot {
+  return OFFICE_CAT_SPOTS.slice().sort((left, right) => {
+    const leftDistance = Math.hypot(officeCat.x - left.x, officeCat.y - left.y);
+    const rightDistance = Math.hypot(officeCat.x - right.x, officeCat.y - right.y);
+    return leftDistance - rightDistance;
+  })[0];
+}
+
+function fillBossCatTemplate(template: string): string {
+  const nearestSpot = findNearestOfficeCatSpot();
+  const personality = getOfficeCatPersonality();
+  return template
+    .replace(/\{catName\}/g, personality.bossLabel)
+    .replace(/\{catPersona\}/g, describeOfficeCatPersona())
+    .replace(/\{catAction\}/g, describeOfficeCatAction(officeCat.action))
+    .replace(/\{catSpot\}/g, nearestSpot.label);
+}
+
+function pickBossIdleLine(): string {
+  if (officeCat.active && Math.random() < 0.56) {
+    const catLines =
+      officeCat.personalityId === "boss-cat"
+        ? OPS_AI_BOSS_CAT_IDLE_LINES
+        : OPS_AI_CAT_IDLE_LINES;
+    return fillBossCatTemplate(pickRandom(catLines));
+  }
+
+  if (!currentGitState.available || !currentGitState.hasChanges) {
+    return pickRandom(OPS_AI_IDLE_LINES);
+  }
+
+  const everyoneIdle = areAllAgentsIdle();
+  const dirtyGitChance = everyoneIdle ? 0.78 : 0.34;
+  if (Math.random() >= dirtyGitChance) {
+    return pickRandom(OPS_AI_IDLE_LINES);
+  }
+
+  const pool = everyoneIdle
+    ? OPS_AI_DIRTY_GIT_ALL_IDLE_LINES
+    : OPS_AI_DIRTY_GIT_IDLE_LINES;
+  return fillBossIdleTemplate(pickRandom(pool), currentGitState);
 }
 
 function wrapWords(line: string, maxChars: number): string[] {
@@ -3494,7 +4095,7 @@ function drawPixelRect(
 function drawMangaBadge(agent: AgentVisualState, x: number, y: number) {
   const palette = AGENT_MANGA_PALETTES[agent.id];
   let text = palette.badge;
-  if (agent.status === "idle" && agent.routine === "sleep") {
+  if (isSleepSettled(agent)) {
     text = "ZZ";
   } else if (agent.status === "idle" && agent.routine === "dance") {
     text = "!!";
@@ -3560,6 +4161,59 @@ function drawPlantWateringEffect(
 
   const leafPulse = Math.sin(nowMs * 0.013 + agent.bob) > 0 ? "#9ff7c5" : "#7fe2b3";
   drawPixelRect(PLANT_WATER_TARGET.x - 1, PLANT_WATER_TARGET.y - 1, 3, 2, leafPulse);
+}
+
+function drawSleepingCharacter(
+  agent: AgentVisualState,
+  x: number,
+  y: number,
+  nowMs: number,
+) {
+  const palette = AGENT_MANGA_PALETTES[agent.id];
+  const bodyColor = resolveAgentBodyColor(agent, palette);
+  const drift = Math.sin(nowMs * 0.008 + agent.bob) * 0.6;
+  const drawX = Math.floor(x - 11);
+  const drawY = Math.floor(y + 7 + drift);
+
+  drawPixelRect(drawX + 2, drawY + 18, 24, 2, "rgba(90, 104, 130, 0.24)");
+
+  drawPixelRect(drawX + 1, drawY + 8, 8, 7, "#f5fbff");
+  drawPixelRect(drawX + 2, drawY + 9, 6, 5, "#ffffff");
+  drawPixelRect(drawX + 1, drawY + 14, 7, 1, "#d7e2ef");
+
+  drawPixelRect(drawX + 7, drawY + 6, 16, 9, palette.outline);
+  drawPixelRect(drawX + 8, drawY + 7, 14, 7, bodyColor);
+  drawPixelRect(drawX + 11, drawY + 8, 10, 5, palette.coat);
+  drawPixelRect(drawX + 20, drawY + 7, 4, 6, palette.coatShade);
+  drawPixelRect(drawX + 12, drawY + 9, 3, 2, palette.accent);
+
+  drawPixelRect(drawX + 4, drawY + 5, 8, 8, palette.outline);
+  drawPixelRect(drawX + 5, drawY + 6, 6, 6, palette.skin);
+  drawPixelRect(drawX + 4, drawY + 3, 8, 4, palette.hair);
+  drawPixelRect(drawX + 5, drawY + 5, 6, 2, palette.hairShade);
+
+  drawPixelRect(drawX + 7, drawY + 9, 2, 1, palette.outline);
+  drawPixelRect(drawX + 9, drawY + 9, 1, 1, palette.outline);
+  drawPixelRect(drawX + 7, drawY + 10, 3, 1, "#e5acb9");
+
+  drawPixelRect(drawX + 22, drawY + 8, 3, 4, palette.outline);
+  drawPixelRect(drawX + 23, drawY + 9, 2, 2, palette.accent);
+
+  if (agent.id === "scout") {
+    drawPixelRect(drawX + 2, drawY + 12, 2, 3, palette.outline);
+    drawPixelRect(drawX + 3, drawY + 13, 1, 1, palette.visor);
+  } else if (agent.id === "builder") {
+    drawPixelRect(drawX + 23, drawY + 12, 4, 2, palette.accent);
+    drawPixelRect(drawX + 24, drawY + 11, 2, 1, palette.effect);
+  } else {
+    drawPixelRect(drawX + 22, drawY + 13, 4, 3, palette.outline);
+    drawPixelRect(drawX + 23, drawY + 14, 2, 1, palette.effect);
+  }
+
+  ctx.font = "7px monospace";
+  ctx.fillStyle = "#f2f7ff";
+  ctx.fillText("z", drawX + 24, drawY + 3);
+  ctx.fillText("z", drawX + 27, drawY + 0);
 }
 
 function resolveWorkAnimationMode(
@@ -3644,8 +4298,15 @@ function drawSpriteCharacter(
   routineSleep: boolean,
   routinePause: boolean,
   settledWork: boolean,
+  settledSleep: boolean,
   workMode?: WorkAnimationMode,
 ) {
+  if (settledSleep) {
+    drawSleepingCharacter(agent, x, y, nowMs);
+    drawMangaBadge(agent, x + 4, y + 8);
+    return;
+  }
+
   const palette = AGENT_MANGA_PALETTES[agent.id];
   const bodyColor = resolveAgentBodyColor(agent, palette);
   const variant =
@@ -3853,12 +4514,15 @@ function drawSpriteCharacter(
 
 function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
   const routineDance = agent.status === "idle" && agent.routine === "dance";
-  const routineSleep = agent.status === "idle" && agent.routine === "sleep";
+  const sleepRequested = agent.status === "idle" && agent.routine === "sleep";
   const routinePause = agent.status === "idle" && agent.routine === "pause";
   const workMode = resolveWorkAnimationMode(agent);
+  const settledSleep = isSleepSettled(agent);
+  const settledPlantWatering = isPlantWateringSettled(agent);
+  const routineSleep = sleepRequested && settledSleep;
   const settledWork =
     Boolean(workMode) &&
-    Math.hypot(agent.targetX - agent.x, agent.targetY - agent.y) < 4.2;
+    distanceToTarget(agent) < 4.2;
 
   // Idle-animatie: snelheid en amplitude per agent
   const idleSpeed = AGENT_PERSONALITIES[agent.id].driftFreq;
@@ -3881,8 +4545,10 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     extraWobble = Math.sin(nowMs * 0.03 + agent.bob) * 1.2;
   }
   if (overlay && overlay.action === "water-plant") {
-    wateringPlant = true;
-    extraWobble = Math.sin(nowMs * 0.025 + agent.bob) * 1.1;
+    wateringPlant = settledPlantWatering;
+    if (settledPlantWatering) {
+      extraWobble = Math.sin(nowMs * 0.025 + agent.bob) * 1.1;
+    }
   }
   const workWobble = settledWork
     ? Math.sin(nowMs * 0.009 + agent.bob) * 0.35
@@ -3894,7 +4560,11 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     workWobble;
   const x = Math.floor(agent.x);
   const y = Math.floor(agent.y + wobble - 16);
-  const paused = nowMs < agent.pauseUntilMs || routinePause || routineSleep;
+  const paused =
+    nowMs < agent.pauseUntilMs ||
+    routinePause ||
+    settledSleep ||
+    settledPlantWatering;
   const cadence =
     agent.id === "builder" ? 16 : agent.id === "reviewer" ? 20 : 18;
   let step =
@@ -3913,6 +4583,7 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     routineSleep,
     routinePause,
     settledWork,
+    settledSleep,
     workMode,
   );
 
@@ -3952,6 +4623,239 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     ctx.fillStyle = "#9ff7c5";
     ctx.fillText("plant!", x + 18, y - 8);
   }
+}
+
+function drawOfficeCatSpeech(nowMs: number, baseX: number, baseY: number) {
+  if (!officeCat.meowText || nowMs > officeCat.meowVisibleUntilMs) {
+    return;
+  }
+
+  ctx.font = "7px monospace";
+  const text = shorten(officeCat.meowText, 20);
+  const width = Math.max(28, Math.ceil(ctx.measureText(text).width) + 10);
+  const height = 12;
+  const x = clamp(
+    Math.floor(baseX - width / 2),
+    BUBBLE_EDGE_MARGIN_PX,
+    canvas.width - width - BUBBLE_EDGE_MARGIN_PX,
+  );
+  const y = clamp(
+    baseY - 18,
+    BUBBLE_EDGE_MARGIN_PX,
+    canvas.height - height - BUBBLE_EDGE_MARGIN_PX,
+  );
+  const tailX = clamp(baseX, x + 3, x + width - 4);
+
+  ctx.fillStyle = "#fbfcff";
+  ctx.fillRect(x, y, width, height);
+  ctx.fillStyle = "#2f3650";
+  ctx.fillRect(x, y, width, 1);
+  ctx.fillRect(x, y + height - 1, width, 1);
+  ctx.fillRect(x, y, 1, height);
+  ctx.fillRect(x + width - 1, y, 1, height);
+  ctx.fillRect(tailX - 1, y + height, 3, 2);
+  ctx.fillRect(tailX, y + height + 2, 1, 2);
+  ctx.fillStyle = "#253048";
+  ctx.fillText(text, x + 5, y + 8);
+}
+
+function drawOfficeCat(nowMs: number) {
+  if (!officeCat.active) {
+    return;
+  }
+
+  const personality = getOfficeCatPersonality();
+  const catWidth = 22;
+  const motionBob =
+    officeCat.action === "nap"
+      ? Math.sin(nowMs * 0.006 + officeCat.bob) * 0.45
+      : Math.sin(nowMs * 0.012 + officeCat.bob) * 0.9;
+  const baseX = Math.floor(officeCat.x) - 11;
+  const baseY = Math.floor(officeCat.y - 12 + motionBob);
+  const stride = officeCat.frame % 14 < 7 ? 0 : 1;
+  const fur =
+    officeCat.action === "nap"
+      ? personality.furShade
+      : personality.fur;
+  const furShade = personality.furShade;
+  const outline = personality.outline;
+  const ear = personality.ear;
+  const eye = officeCat.action === "nap" ? outline : personality.eye;
+  const nose = personality.nose;
+  const speedLineColor = "rgba(214, 241, 255, 0.4)";
+
+  const catRect = (
+    dx: number,
+    dy: number,
+    width: number,
+    height: number,
+    color: string,
+  ) => {
+    const drawX =
+      officeCat.facing === 1
+        ? baseX + dx
+        : baseX + (catWidth - (dx + width));
+    drawPixelRect(drawX, baseY + dy, width, height, color);
+  };
+
+  drawPixelRect(baseX + 4, baseY + 17, 14, 2, personality.shadow);
+
+  if (officeCat.action === "zoom" || officeCat.mode === "entering" || officeCat.mode === "leaving") {
+    drawPixelRect(baseX - 4, baseY + 7, 2, 6, speedLineColor);
+    drawPixelRect(baseX - 7, baseY + 9, 1, 4, speedLineColor);
+    drawPixelRect(baseX + catWidth + 4, baseY + 7, 2, 6, speedLineColor);
+  }
+
+  if (officeCat.action === "loaf" || officeCat.action === "nap") {
+    catRect(4, 8, 11, 6, outline);
+    catRect(5, 9, 9, 4, fur);
+    catRect(12, 6, 5, 5, outline);
+    catRect(13, 7, 3, 3, fur);
+    catRect(12, 5, 2, 2, outline);
+    catRect(13, 6, 1, 1, ear);
+    catRect(15, 5, 2, 2, outline);
+    catRect(15, 6, 1, 1, ear);
+    catRect(3, 10, 3, 2, outline);
+    catRect(4, 10, 2, 1, furShade);
+    catRect(9, 10, 1, 1, furShade);
+    if (officeCat.action === "nap") {
+      catRect(13, 8, 1, 1, eye);
+      catRect(15, 8, 1, 1, eye);
+      ctx.font = "7px monospace";
+      ctx.fillStyle = "#f3f7ff";
+      ctx.fillText("z", baseX + 19, baseY + 4);
+    } else {
+      catRect(13, 8, 1, 1, outline);
+      catRect(15, 8, 1, 1, outline);
+    }
+    catRect(14, 9, 1, 1, nose);
+  } else if (officeCat.action === "sit" || officeCat.action === "groom") {
+    catRect(5, 7, 7, 8, outline);
+    catRect(6, 8, 5, 6, fur);
+    catRect(11, 5, 5, 6, outline);
+    catRect(12, 6, 3, 4, fur);
+    catRect(11, 4, 2, 2, outline);
+    catRect(12, 5, 1, 1, ear);
+    catRect(14, 4, 2, 2, outline);
+    catRect(14, 5, 1, 1, ear);
+    catRect(3, 11, 3, 4, outline);
+    catRect(4, 12, 1, 2, furShade);
+    catRect(9, 15, 4, 2, outline);
+    catRect(10, 15, 2, 1, furShade);
+    catRect(12, 8, 1, 1, eye);
+    catRect(14, 8, 1, 1, eye);
+    catRect(13, 9, 1, 1, nose);
+    if (officeCat.action === "groom") {
+      catRect(9, 5, 2, 6, outline);
+      catRect(9, 6, 1, 4, fur);
+      catRect(9, 4, 1, 1, furShade);
+      catRect(14, 12, 1, 1, outline);
+    }
+  } else {
+    const legLift = stride === 0 ? 0 : 1;
+    const tailLift = officeCat.action === "zoom" ? -2 : -1;
+    catRect(5, 8, 9, 5, outline);
+    catRect(6, 9, 7, 3, fur);
+    catRect(12, 6, 5, 5, outline);
+    catRect(13, 7, 3, 3, fur);
+    catRect(12, 4, 2, 3, outline);
+    catRect(13, 5, 1, 1, ear);
+    catRect(15, 4, 2, 3, outline);
+    catRect(15, 5, 1, 1, ear);
+    catRect(2, 6 + tailLift, 2, 7, outline);
+    catRect(3, 7 + tailLift, 1, 5, furShade);
+    catRect(6, 12 + legLift, 2, 4, outline);
+    catRect(11, 12, 2, 4, outline);
+    catRect(7, 13 + legLift, 1, 2, furShade);
+    catRect(12, 13, 1, 2, furShade);
+    catRect(13, 8, 1, 1, eye);
+    catRect(15, 8, 1, 1, eye);
+    catRect(14, 9, 1, 1, nose);
+  }
+
+  if (officeCat.action === "zoom") {
+    catRect(1, 9, 2, 1, furShade);
+    catRect(17, 10, 2, 1, furShade);
+  }
+
+  if (personality.id === "chaos-goblin") {
+    catRect(6, 8, 2, 1, "#fff1c4");
+    catRect(9, 10, 2, 1, "#fff1c4");
+    catRect(3, 6, 1, 2, "#8d3b1f");
+  } else if (personality.id === "senior-office-cat") {
+    catRect(11, 10, 4, 1, "#eef3ff");
+    catRect(12, 11, 2, 1, "#eef3ff");
+    catRect(7, 15, 5, 1, "#6b7286");
+  } else if (personality.id === "boss-cat") {
+    catRect(10, 5, 5, 1, "#1f2430");
+    catRect(11, 6, 3, 2, "#1f2430");
+    catRect(14, 8, 2, 2, "#8fd3ff");
+    catRect(15, 9, 1, 1, "#f5fbff");
+    catRect(4, 6, 2, 1, "#fff7cf");
+    catRect(5, 7, 1, 1, "#fff7cf");
+  }
+
+  drawOfficeCatSpeech(nowMs, baseX + 11, baseY);
+}
+
+function tickOfficeCat(nowMs: number) {
+  if (!officeCat.active) {
+    if (nowMs >= officeCat.nextSpawnAtMs) {
+      spawnOfficeCat(nowMs);
+    }
+    return;
+  }
+
+  if (officeCat.meowVisibleUntilMs > 0 && nowMs > officeCat.meowVisibleUntilMs) {
+    clearOfficeCatMeow();
+  }
+
+  const dx = officeCat.targetX - officeCat.x;
+  const dy = officeCat.targetY - officeCat.y;
+  const distance = officeCatDistanceToTarget();
+
+  if (Math.abs(dx) > 0.1) {
+    officeCat.facing = dx >= 0 ? 1 : -1;
+  }
+
+  const shouldMove =
+    officeCat.mode === "entering" ||
+    officeCat.mode === "wandering" ||
+    officeCat.mode === "leaving" ||
+    officeCat.action === "zoom";
+
+  if (shouldMove && distance > 0.25) {
+    const step = Math.min(distance, officeCat.speed);
+    officeCat.x += (dx / Math.max(0.0001, distance)) * step;
+    officeCat.y += (dy / Math.max(0.0001, distance)) * step;
+  }
+
+  officeCat.frame += shouldMove ? 1 : officeCat.action === "nap" ? 0.08 : 0.24;
+
+  if (officeCat.mode === "entering" && distance < 1.8) {
+    startOfficeCatAction(nowMs, pickOfficeCatLoungeAction());
+  } else if (officeCat.mode === "wandering" && distance < 1.8) {
+    startOfficeCatAction(nowMs, pickOfficeCatLoungeAction());
+  } else if (officeCat.mode === "lounging" && nowMs >= officeCat.nextDecisionAtMs) {
+    chooseNextOfficeCatBeat(nowMs);
+  } else if (officeCat.mode === "leaving") {
+    const hasExited =
+      (officeCat.exitSide === "left" && officeCat.x <= FLOOR_BOUNDS.left - 24) ||
+      (officeCat.exitSide === "right" && officeCat.x >= FLOOR_BOUNDS.right + 24);
+    if (hasExited) {
+      officeCat.active = false;
+      officeCat.mode = "offstage";
+      officeCat.action = "walk";
+      clearOfficeCatMeow();
+      officeCat.nextSpawnAtMs =
+        nowMs + randomRange(OFFICE_CAT_MIN_SPAWN_MS, OFFICE_CAT_MAX_SPAWN_MS);
+    }
+  }
+
+  if (officeCat.mode !== "leaving") {
+    officeCat.x = clamp(officeCat.x, FLOOR_BOUNDS.left - 32, FLOOR_BOUNDS.right + 32);
+  }
+  officeCat.y = clamp(officeCat.y, FLOOR_BOUNDS.top + 18, FLOOR_BOUNDS.bottom + 3);
 }
 
 function buildSpeechLayout(
@@ -4137,10 +5041,14 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
       (busyPause ? randomRange(1300, 3600) : randomRange(2100, 4900));
   }
 
-  const routinePause =
-    agent.status === "idle" &&
-    (agent.routine === "pause" || agent.routine === "sleep");
-  const paused = nowMs < agent.pauseUntilMs || routinePause;
+  const routinePause = agent.status === "idle" && agent.routine === "pause";
+  const sleepSettled = isSleepSettled(agent);
+  const plantWateringSettled = isPlantWateringSettled(agent);
+  const paused =
+    nowMs < agent.pauseUntilMs ||
+    routinePause ||
+    sleepSettled ||
+    plantWateringSettled;
 
   const speedBase = inWorkZone ? 1.12 : 0.82;
   const speed =
@@ -4208,6 +5116,7 @@ function drawFrame() {
   const nowEpochMs = Date.now();
   maybeRunBossIdleChatter();
   drawScene(nowMs);
+  tickOfficeCat(nowMs);
   maybeRunIdleChatter();
 
   for (const id of agentOrder) {
@@ -4215,6 +5124,8 @@ function drawFrame() {
     tickAgent(agent, nowMs);
     drawAgentBlock(agent, nowMs);
   }
+
+  drawOfficeCat(nowMs);
 
   drawBossDispatchLink(nowMs);
 

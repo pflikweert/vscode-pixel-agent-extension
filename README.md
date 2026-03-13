@@ -8,7 +8,7 @@
 - **Codex import & auto-discovery**: import van externe Codex/OpenAI agent events via JSONL-bestand of automatische detectie van lokale Codex sessies.
 - **Verbeterde panel fallback**: robuuste recovery bij devserver issues, automatische terugval op embedded/prod UI.
 - **Uitgebreide event types**: nu ook Copilot LM, Codex, export, git, terminal, tasks, diagnostics en meer.
-- **Dynamische agent scene**: command-room met Ops AI monitor, workstations, bureau-specifieke werkanimaties, idle-lus, plantzorg en custom sprites.
+- **Dynamische agent scene**: command-room met Ops AI monitor, workstations, bureau-specifieke werkanimaties, idle-lus, plantzorg, kantoor-kat cameos en custom sprites.
 
 
 Standalone VS Code extensie in een eigen repository met:
@@ -29,6 +29,8 @@ Standalone VS Code extensie in een eigen repository met:
 - Codex telemetry via handmatige JSONL-import en automatische native discovery van `~/.codex` of `$CODEX_HOME`
 - terminal command telemetry (start/einde + exit status), inclusief source-detectie voor `local` en `codex`
 - vernieuwde vierkante lounge-scene met kamerachtergrond, workstations, Ops AI monitor, speech bubbles en idle acties
+- git-aware Ops AI idle chatter die inspeelt op dirty branches en lounge-status
+- spontane kantoor-kat visits met meerdere persoonlijkheden, animaties en meow/speech bubbles
 - fasegestuurde agentstatus in UI (`wacht op input`, `analyseert`, `antwoordt`, `bezig`, `afgerond`, `fout`)
 - custom pixel/manga agent-rendering met statusaccenten voor working/completed/error en werkmodi zoals thinking/typing/reviewing
 - opgeschoonde speech bubbles voor Codex tool-output, zonder terminalruis zoals chunk headers of ANSI kleurcodes
@@ -237,9 +239,11 @@ Belangrijkste velden per runtime event:
 
 - de scene is nu een vierkante lounge/command-room (`320x320`) met kamerachtergrond, workstations (Research/Engineering/QA), brede lounge-lus, rustbed, planthoek en centrale Ops AI monitor
 - de Ops AI monitor reageert op binnenkomende prompts (`chat.userPrompt`, `codex.userMessage`) en laat dispatches (`ops.dispatch`) richting de gekozen agent zien
+- de Ops AI monitor heeft extra idle chatter voor dirty git states en kantoor-kat activiteit, zodat de command-room ook zonder nieuwe events levendig blijft
 - agents verplaatsen automatisch naar een workstation bij `working`, `completed` of `error`
 - workstation-keuze gebeurt op basis van status + fase + taaktekst (bijv. lint/test/review -> QA, build/tsc/vite -> Engineering)
-- idle agents volgen een lounge-route en doen korte routines zoals pause/dance/sleep, telefoon, zwaaien en plantzorg; het rustbed blijft bezet door maximaal 1 slapende agent tegelijk
+- idle agents volgen een lounge-route en doen korte routines zoals pause/dance/sleep, telefoon, zwaaien en plantzorg; het rustbed blijft bezet door maximaal 1 slapende agent tegelijk en settle-momenten houden slaap- en plantanimaties rustiger op hun plek
+- een kantoor-kat kan af en toe de vloer opkomen, rondzwerven, loungen bij vaste spots, miauwen en weer vertrekken; persoonlijkheden variëren van `Stacktrace` tot `Director Whiskers`
 - agenten worden als custom pixel/manga karakters gerenderd met visuele statusaccenten zoals speed lines, sparks en error-markers
 - zodra een agent bij een werkplek is aangekomen, wisselt de animatie mee met de taak (`thinking`, `typing`, `reviewing`, `completed`, `error`)
 - speech bubbles en Ops AI-dialogen strippen tooling-metadata zoals `Chunk ID`, `Wall time`, `Process exited with code` en ANSI escape-sequenties voordat tekst in de scene verschijnt

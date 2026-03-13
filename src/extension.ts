@@ -11,6 +11,9 @@ const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
 const MAX_COMMAND_PREVIEW_LENGTH = 120;
 const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = true;
 const TEST_EVENT_STEP_DELAY_MS = 420;
+const AGENT_INACTIVITY_IDLE_MS = 60000;
+const GIT_STATE_EVENT_DEBOUNCE_MS = 450;
+const TYPING_BURST_IDLE_MS = 1600;
 
 type AgentId = 'scout' | 'builder' | 'reviewer';
 type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
@@ -33,12 +36,82 @@ interface PixelRuntimeEvent {
   agentId?: AgentId;
   status?: AgentStatus;
   progress?: number;
+  git?: GitViewState;
 }
 
 interface RuntimeState {
   agents: Record<AgentId, AgentViewState>;
   eventLog: PixelRuntimeEvent[];
   statusLine: string;
+  git: GitViewState;
+}
+
+interface GitViewState {
+  available: boolean;
+  branch: string;
+  ahead: number;
+  behind: number;
+  staged: number;
+  unstaged: number;
+  conflicts: number;
+  hasChanges: boolean;
+  lastCommit: string;
+  repositoryRoot: string;
+  message: string;
+}
+
+interface GitExtensionExports {
+  getAPI(version: 1): GitApi;
+}
+
+interface GitApi {
+  repositories: GitRepository[];
+  onDidOpenRepository: vscode.Event<GitRepository>;
+  onDidCloseRepository: vscode.Event<GitRepository>;
+}
+
+interface GitRepository {
+  rootUri: vscode.Uri;
+  state: GitRepositoryState;
+}
+
+interface GitRepositoryState {
+  HEAD: {
+    name?: string;
+    commit?: string;
+    ahead?: number;
+    behind?: number;
+  } | undefined;
+  indexChanges: GitChange[];
+  workingTreeChanges: GitChange[];
+  mergeChanges: GitChange[];
+  onDidChange: vscode.Event<void>;
+}
+
+interface GitChange {
+  uri: vscode.Uri;
+}
+
+interface TypingBurstState {
+  filePath: string;
+  agentId: AgentId;
+  lastChangeAt: number;
+  changes: number;
+  charsChanged: number;
+  pulseIndex: number;
+  nextProgress: number;
+  heartbeatTimer?: NodeJS.Timeout;
+  stopTimer?: NodeJS.Timeout;
+}
+
+interface AgentBurstProfile {
+  heartbeatMs: number;
+  startSummary: string;
+  tickSummaries: string[];
+  pauseSummary: string;
+  minProgress: number;
+  maxProgress: number;
+  rhythm: number[];
 }
 
 type ExtensionToWebviewMessage =
@@ -60,6 +133,36 @@ const AGENT_LABELS: Record<AgentId, string> = {
   reviewer: 'Reviewer'
 };
 
+const AGENT_BURST_PROFILES: Record<AgentId, AgentBurstProfile> = {
+  scout: {
+    heartbeatMs: 980,
+    startSummary: 'Scout verkent context',
+    tickSummaries: ['Scout leest referenties', 'Scout vergelijkt aanpakken', 'Scout markeert aandachtspunten'],
+    pauseSummary: 'Scout rondt de verkenning af',
+    minProgress: 26,
+    maxProgress: 86,
+    rhythm: [5, 3, 6, 4, 2]
+  },
+  builder: {
+    heartbeatMs: 760,
+    startSummary: 'Builder start met coderen',
+    tickSummaries: ['Builder typt featurecode', 'Builder werkt implementatie bij', 'Builder plakt de laatste pixels'],
+    pauseSummary: 'Builder pauzeert even',
+    minProgress: 34,
+    maxProgress: 94,
+    rhythm: [8, 6, 7, 5, 9]
+  },
+  reviewer: {
+    heartbeatMs: 1120,
+    startSummary: 'Reviewer duikt in checks',
+    tickSummaries: ['Reviewer checkt randgevallen', 'Reviewer scherpt validaties aan', 'Reviewer fixt feedbackpunten'],
+    pauseSummary: 'Reviewer zet de checks klaar',
+    minProgress: 28,
+    maxProgress: 90,
+    rhythm: [4, 5, 3, 6, 4]
+  }
+};
+
 let panelRef: vscode.WebviewPanel | undefined;
 let panelReady = false;
 let queuedMessages: ExtensionToWebviewMessage[] = [];
@@ -68,6 +171,7 @@ let panelReadyWatchdog: NodeJS.Timeout | undefined;
 let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
 const lastDocumentChangeEventAt = new Map<string, number>();
+const typingBurstStates = new Map<string, TypingBurstState>();
 
 export function activate(context: vscode.ExtensionContext) {
   runtimeState = createInitialRuntimeState();
@@ -199,6 +303,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(participant);
   registerRuntimeListeners(context);
+  void registerGitRuntimeListeners(context);
 
   emitRuntimeEvent({
     type: 'extension.activated',
@@ -217,6 +322,16 @@ export function deactivate() {
     clearTimeout(timer);
   }
   idleTimers.clear();
+
+  for (const state of typingBurstStates.values()) {
+    if (state.heartbeatTimer) {
+      clearInterval(state.heartbeatTimer);
+    }
+    if (state.stopTimer) {
+      clearTimeout(state.stopTimer);
+    }
+  }
+  typingBurstStates.clear();
 }
 
 function registerRuntimeListeners(context: vscode.ExtensionContext) {
@@ -230,30 +345,35 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
 
     const key = event.document.uri.toString();
     const now = Date.now();
+    const filePath = normalizePath(event.document.uri);
+    const changedChars = estimateChangedCharacters(event.contentChanges);
+    const typingAgentId = startOrUpdateTypingBurst(key, filePath, changedChars, now);
+
     const lastAt = lastDocumentChangeEventAt.get(key) ?? 0;
     if (now - lastAt < EVENT_THROTTLE_MS) {
       return;
     }
     lastDocumentChangeEventAt.set(key, now);
 
-    const filePath = normalizePath(event.document.uri);
     emitRuntimeEvent({
       type: 'workspace.fileChanged',
       timestamp: now,
       summary: 'Bestand gewijzigd',
       detail: filePath,
       filePath,
-      agentId: 'scout',
+      agentId: typingAgentId,
       status: 'working',
       progress: 35
     });
-    scheduleAgentIdle('scout', IDLE_TIMEOUT_MS);
+    scheduleAgentIdle(typingAgentId, IDLE_TIMEOUT_MS);
   });
 
   const saveListener = vscode.workspace.onDidSaveTextDocument((document) => {
     if (document.uri.scheme !== 'file') {
       return;
     }
+
+    stopTypingBurst(document.uri.toString(), false);
 
     const filePath = normalizePath(document.uri);
     emitRuntimeEvent({
@@ -290,6 +410,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const deleteListener = vscode.workspace.onDidDeleteFiles((event) => {
     const now = Date.now();
     for (const uri of event.files) {
+      stopTypingBurst(uri.toString(), false);
       const filePath = normalizePath(uri);
       emitRuntimeEvent({
         type: 'workspace.fileDeleted',
@@ -308,6 +429,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const renameListener = vscode.workspace.onDidRenameFiles((event) => {
     const now = Date.now();
     for (const change of event.files) {
+      stopTypingBurst(change.oldUri.toString(), false);
       const from = normalizePath(change.oldUri);
       const to = normalizePath(change.newUri);
       emitRuntimeEvent({
@@ -575,6 +697,441 @@ function collectDiagnosticsSummary(uris: readonly vscode.Uri[]): {
   };
 }
 
+function estimateChangedCharacters(changes: readonly vscode.TextDocumentContentChangeEvent[]): number {
+  let total = 0;
+  for (const change of changes) {
+    total += Math.max(change.rangeLength, change.text.length);
+  }
+  return Math.max(1, Math.min(2000, total));
+}
+
+function inferAgentForFilePath(filePath: string): AgentId {
+  const lower = filePath.toLowerCase();
+  if (/(test|spec|lint|eslint|qa|diagnostic|ci)/.test(lower)) {
+    return 'reviewer';
+  }
+  if (/(readme|docs?|\.md$|changelog|notes)/.test(lower)) {
+    return 'scout';
+  }
+  return 'builder';
+}
+
+function getBurstProfile(agentId: AgentId): AgentBurstProfile {
+  return AGENT_BURST_PROFILES[agentId];
+}
+
+function nextBurstProgress(state: TypingBurstState): number {
+  const profile = getBurstProfile(state.agentId);
+  const rhythmStep = profile.rhythm[state.pulseIndex % profile.rhythm.length];
+  state.pulseIndex += 1;
+
+  const hesitation = state.changes % 6 === 0 ? -2 : 0;
+  const next = state.nextProgress + rhythmStep + hesitation;
+  return Math.max(profile.minProgress, Math.min(profile.maxProgress, next));
+}
+
+function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: number, now: number): AgentId {
+  let state = typingBurstStates.get(key);
+
+  if (!state) {
+    const agentId = inferAgentForFilePath(filePath);
+    const profile = getBurstProfile(agentId);
+
+    state = {
+      filePath,
+      agentId,
+      lastChangeAt: now,
+      changes: 0,
+      charsChanged: 0,
+      pulseIndex: 0,
+      nextProgress: profile.minProgress
+    };
+
+    state.heartbeatTimer = setInterval(() => {
+      const active = typingBurstStates.get(key);
+      if (!active) {
+        return;
+      }
+
+      if (Date.now() - active.lastChangeAt > TYPING_BURST_IDLE_MS) {
+        return;
+      }
+
+      const activeProfile = getBurstProfile(active.agentId);
+      active.nextProgress = nextBurstProgress(active);
+      const tickSummary = activeProfile.tickSummaries[active.pulseIndex % activeProfile.tickSummaries.length];
+
+      emitRuntimeEvent({
+        type: 'workspace.typingBurstTick',
+        timestamp: Date.now(),
+        summary: tickSummary,
+        detail: `${active.filePath} | ${active.changes} edits, ${active.charsChanged} chars`,
+        filePath: active.filePath,
+        agentId: active.agentId,
+        status: 'working',
+        progress: active.nextProgress
+      });
+      scheduleAgentIdle(active.agentId, IDLE_TIMEOUT_MS);
+    }, profile.heartbeatMs);
+
+    typingBurstStates.set(key, state);
+
+    emitRuntimeEvent({
+      type: 'workspace.typingBurstStarted',
+      timestamp: now,
+      summary: profile.startSummary,
+      detail: filePath,
+      filePath,
+      agentId,
+      status: 'working',
+      progress: state.nextProgress
+    });
+    scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
+  }
+
+  state.filePath = filePath;
+  state.lastChangeAt = now;
+  state.changes += 1;
+  state.charsChanged += changedChars;
+
+  if (state.changes % 5 === 0) {
+    state.nextProgress = Math.max(getBurstProfile(state.agentId).minProgress, state.nextProgress - 1);
+  }
+
+  scheduleTypingBurstStop(key);
+  return state.agentId;
+}
+
+function scheduleTypingBurstStop(key: string) {
+  const state = typingBurstStates.get(key);
+  if (!state) {
+    return;
+  }
+
+  if (state.stopTimer) {
+    clearTimeout(state.stopTimer);
+  }
+
+  state.stopTimer = setTimeout(() => {
+    stopTypingBurst(key, true);
+  }, TYPING_BURST_IDLE_MS);
+}
+
+function stopTypingBurst(key: string, emitPauseEvent: boolean) {
+  const state = typingBurstStates.get(key);
+  if (!state) {
+    return;
+  }
+
+  if (state.heartbeatTimer) {
+    clearInterval(state.heartbeatTimer);
+  }
+  if (state.stopTimer) {
+    clearTimeout(state.stopTimer);
+  }
+
+  typingBurstStates.delete(key);
+
+  if (!emitPauseEvent) {
+    return;
+  }
+
+  const profile = getBurstProfile(state.agentId);
+
+  emitRuntimeEvent({
+    type: 'workspace.typingBurstIdle',
+    timestamp: Date.now(),
+    summary: profile.pauseSummary,
+    detail: `${state.filePath} | ${state.changes} edits, ${state.charsChanged} chars`,
+    filePath: state.filePath,
+    agentId: state.agentId,
+    status: 'completed',
+    progress: 100
+  });
+  scheduleAgentIdle(state.agentId, IDLE_TIMEOUT_MS);
+}
+
+function createDefaultGitState(): GitViewState {
+  return {
+    available: false,
+    branch: '-',
+    ahead: 0,
+    behind: 0,
+    staged: 0,
+    unstaged: 0,
+    conflicts: 0,
+    hasChanges: false,
+    lastCommit: '-',
+    repositoryRoot: '-',
+    message: 'Git status wordt geladen.'
+  };
+}
+
+function createGitUnavailableState(message: string): GitViewState {
+  return {
+    ...createDefaultGitState(),
+    message
+  };
+}
+
+function pickPrimaryRepository(repositories: GitRepository[]): GitRepository | undefined {
+  if (repositories.length === 0) {
+    return undefined;
+  }
+
+  const editorUri = vscode.window.activeTextEditor?.document.uri;
+  if (editorUri?.scheme === 'file') {
+    const editorPath = editorUri.fsPath;
+    const matching = repositories
+      .filter((repo) => editorPath.startsWith(repo.rootUri.fsPath))
+      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length);
+    if (matching.length > 0) {
+      return matching[0];
+    }
+  }
+
+  return repositories[0];
+}
+
+function collectGitViewState(api: GitApi): GitViewState {
+  const repository = pickPrimaryRepository(api.repositories);
+  if (!repository) {
+    return createGitUnavailableState('Geen Git repository gevonden in deze workspace.');
+  }
+
+  const head = repository.state.HEAD;
+  const branch = head?.name || '(detached)';
+  const ahead = head?.ahead ?? 0;
+  const behind = head?.behind ?? 0;
+  const staged = repository.state.indexChanges.length;
+  const unstaged = repository.state.workingTreeChanges.length;
+  const conflicts = repository.state.mergeChanges.length;
+  const hasChanges = staged + unstaged + conflicts > 0;
+  const lastCommit = head?.commit ? head.commit.slice(0, 7) : '-';
+  const repositoryRoot = normalizePath(repository.rootUri) || repository.rootUri.fsPath;
+
+  const message =
+    conflicts > 0
+      ? `${conflicts} conflict(en) open`
+      : hasChanges
+        ? `${staged} staged, ${unstaged} unstaged`
+        : 'Werkboom schoon';
+
+  return {
+    available: true,
+    branch,
+    ahead,
+    behind,
+    staged,
+    unstaged,
+    conflicts,
+    hasChanges,
+    lastCommit,
+    repositoryRoot,
+    message
+  };
+}
+
+function describeGitState(git: GitViewState): string {
+  return `staged ${git.staged}, unstaged ${git.unstaged}, conflicts ${git.conflicts}, ahead ${git.ahead}, behind ${git.behind}, head ${git.lastCommit}`;
+}
+
+function buildGitStateSignature(git: GitViewState): string {
+  return [
+    git.available,
+    git.branch,
+    git.ahead,
+    git.behind,
+    git.staged,
+    git.unstaged,
+    git.conflicts,
+    git.hasChanges,
+    git.lastCommit,
+    git.repositoryRoot,
+    git.message
+  ].join('|');
+}
+
+function buildGitRuntimeEvent(git: GitViewState): PixelRuntimeEvent {
+  if (!git.available) {
+    return {
+      type: 'git.unavailable',
+      timestamp: Date.now(),
+      summary: 'Git status niet beschikbaar',
+      detail: git.message,
+      agentId: 'scout',
+      status: 'completed',
+      progress: 100,
+      git
+    };
+  }
+
+  if (git.conflicts > 0) {
+    return {
+      type: 'git.conflictsDetected',
+      timestamp: Date.now(),
+      summary: `Git conflicts gedetecteerd (${git.conflicts})`,
+      detail: `${git.branch} | ${describeGitState(git)}`,
+      agentId: 'reviewer',
+      status: 'error',
+      progress: 100,
+      git
+    };
+  }
+
+  if (git.hasChanges) {
+    return {
+      type: 'git.stateChanged',
+      timestamp: Date.now(),
+      summary: `Git status gewijzigd op ${git.branch}`,
+      detail: describeGitState(git),
+      agentId: 'builder',
+      status: 'working',
+      progress: 70,
+      git
+    };
+  }
+
+  return {
+    type: 'git.clean',
+    timestamp: Date.now(),
+    summary: `Git werkboom schoon op ${git.branch}`,
+    detail: describeGitState(git),
+    agentId: 'scout',
+    status: 'completed',
+    progress: 100,
+    git
+  };
+}
+
+async function registerGitRuntimeListeners(context: vscode.ExtensionContext) {
+  const gitExtension = vscode.extensions.getExtension<GitExtensionExports>('vscode.git');
+  if (!gitExtension) {
+    const unavailable = createGitUnavailableState('Git extension niet gevonden.');
+    runtimeState.git = unavailable;
+    emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
+    return;
+  }
+
+  let gitApi: GitApi | undefined;
+  try {
+    const gitExports = gitExtension.isActive ? gitExtension.exports : await gitExtension.activate();
+    gitApi = gitExports?.getAPI(1);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const unavailable = createGitUnavailableState(`Git API kon niet starten: ${message}`);
+    runtimeState.git = unavailable;
+    emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
+    return;
+  }
+
+  if (!gitApi) {
+    const unavailable = createGitUnavailableState('Git API niet beschikbaar.');
+    runtimeState.git = unavailable;
+    emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
+    return;
+  }
+
+  const repoStateListeners = new Map<string, vscode.Disposable>();
+  let refreshTimer: NodeJS.Timeout | undefined;
+  let lastSignature = '';
+
+  const refreshGitState = (emitEvent: boolean) => {
+    const nextState = collectGitViewState(gitApi);
+    runtimeState.git = nextState;
+
+    const signature = buildGitStateSignature(nextState);
+    if (signature === lastSignature) {
+      return;
+    }
+    lastSignature = signature;
+
+    if (!emitEvent) {
+      return;
+    }
+
+    const event = buildGitRuntimeEvent(nextState);
+    emitRuntimeEvent(event);
+    if (event.agentId) {
+      scheduleAgentIdle(event.agentId, IDLE_TIMEOUT_MS + 2500);
+    }
+  };
+
+  const scheduleRefresh = (emitEvent = true) => {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+    }
+
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      refreshGitState(emitEvent);
+    }, GIT_STATE_EVENT_DEBOUNCE_MS);
+  };
+
+  const trackRepository = (repository: GitRepository) => {
+    const key = repository.rootUri.toString();
+    if (repoStateListeners.has(key)) {
+      return;
+    }
+
+    const listener = repository.state.onDidChange(() => {
+      scheduleRefresh(true);
+    });
+    repoStateListeners.set(key, listener);
+  };
+
+  const untrackRepository = (repository: GitRepository) => {
+    const key = repository.rootUri.toString();
+    const listener = repoStateListeners.get(key);
+    if (!listener) {
+      return;
+    }
+
+    listener.dispose();
+    repoStateListeners.delete(key);
+  };
+
+  for (const repository of gitApi.repositories) {
+    trackRepository(repository);
+  }
+
+  const openRepositoryListener = gitApi.onDidOpenRepository((repository) => {
+    trackRepository(repository);
+    scheduleRefresh(true);
+  });
+
+  const closeRepositoryListener = gitApi.onDidCloseRepository((repository) => {
+    untrackRepository(repository);
+    scheduleRefresh(true);
+  });
+
+  context.subscriptions.push(openRepositoryListener, closeRepositoryListener, {
+    dispose() {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+      }
+      for (const listener of repoStateListeners.values()) {
+        listener.dispose();
+      }
+      repoStateListeners.clear();
+    }
+  });
+
+  refreshGitState(false);
+
+  emitRuntimeEvent({
+    type: 'git.monitoringReady',
+    timestamp: Date.now(),
+    summary: 'Git monitoring actief',
+    detail: `${runtimeState.git.repositoryRoot} | ${runtimeState.git.branch}`,
+    agentId: 'scout',
+    status: 'completed',
+    progress: 100,
+    git: runtimeState.git
+  });
+  scheduleAgentIdle('scout', 4000);
+}
+
 function pickAgentForPrompt(prompt: string, command?: string): AgentId {
   if (command === 'show') {
     return 'scout';
@@ -633,7 +1190,8 @@ function createInitialRuntimeState(): RuntimeState {
       reviewer: createAgentState('reviewer')
     },
     eventLog: [],
-    statusLine: 'IDLE'
+    statusLine: 'IDLE',
+    git: createDefaultGitState()
   };
 }
 
@@ -641,14 +1199,14 @@ function createAgentState(id: AgentId): AgentViewState {
   return {
     id,
     label: AGENT_LABELS[id],
-    task: 'wacht op event',
+    task: 'wacht in lounge',
     status: 'idle',
     progress: 0,
     lastEventAt: Date.now()
   };
 }
 
-function scheduleAgentIdle(agentId: AgentId, timeoutMs: number) {
+function scheduleAgentIdle(agentId: AgentId, _timeoutMs?: number) {
   const existing = idleTimers.get(agentId);
   if (existing) {
     clearTimeout(existing);
@@ -659,12 +1217,12 @@ function scheduleAgentIdle(agentId: AgentId, timeoutMs: number) {
       type: 'agent.idleTimeout',
       timestamp: Date.now(),
       summary: `${AGENT_LABELS[agentId]} terug naar idle`,
-      detail: 'Geen recente events.',
+      detail: '60s geen events ontvangen.',
       agentId,
       status: 'idle',
       progress: 0
     });
-  }, timeoutMs);
+  }, AGENT_INACTIVITY_IDLE_MS);
   idleTimers.set(agentId, timer);
 }
 
@@ -749,10 +1307,9 @@ function emitSyntheticTestEvents() {
     }, step.delayMs);
   }
 
-  const idleDelay = TEST_EVENT_STEP_DELAY_MS * 6;
-  scheduleAgentIdle('scout', idleDelay);
-  scheduleAgentIdle('builder', idleDelay + 400);
-  scheduleAgentIdle('reviewer', idleDelay + 800);
+  scheduleAgentIdle('scout');
+  scheduleAgentIdle('builder');
+  scheduleAgentIdle('reviewer');
 }
 
 function emitRuntimeEvent(event: PixelRuntimeEvent) {
@@ -767,6 +1324,10 @@ function emitRuntimeEvent(event: PixelRuntimeEvent) {
 }
 
 function applyEventToRuntimeState(event: PixelRuntimeEvent) {
+  if (event.git) {
+    runtimeState.git = event.git;
+  }
+
   if (event.agentId) {
     const agent = runtimeState.agents[event.agentId];
     agent.lastEventAt = event.timestamp;
@@ -1442,21 +2003,23 @@ function getWebviewHtml(webview: vscode.Webview): string {
   <title>Pixel Agent</title>
   <style>
     :root {
-      --bg: #151821;
-      --panel: #202534;
-      --line: #2f3650;
-      --text: #f6f7ff;
-      --mint: #69f0c4;
-      --sun: #ffd166;
-      --rose: #ff6f91;
+      --bg: #121826;
+      --panel: #1b2538;
+      --line: #314662;
+      --text: #ecf3ff;
+      --muted: #9cb0cb;
+      --mint: #66e0be;
+      --sun: #ffd27a;
+      --rose: #ff7e9f;
+      --cyan: #7cd9ff;
     }
 
     body {
       margin: 0;
       min-height: 100vh;
       background:
-        radial-gradient(circle at 20% 20%, rgba(105, 240, 196, 0.14), transparent 40%),
-        radial-gradient(circle at 80% 80%, rgba(255, 111, 145, 0.18), transparent 36%),
+        radial-gradient(circle at 14% 14%, rgba(102, 224, 190, 0.2), transparent 38%),
+        radial-gradient(circle at 83% 88%, rgba(255, 126, 159, 0.22), transparent 42%),
         var(--bg);
       color: var(--text);
       font-family: 'Courier New', monospace;
@@ -1468,20 +2031,49 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .wrap {
       width: min(92vw, 700px);
       border: 2px solid var(--line);
-      background: linear-gradient(180deg, rgba(32, 37, 52, 0.95), rgba(21, 24, 33, 0.96));
-      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
-      border-radius: 8px;
-      padding: 16px;
+      background: linear-gradient(180deg, rgba(27, 37, 56, 0.96), rgba(17, 24, 37, 0.98));
+      box-shadow: 0 24px 52px rgba(1, 6, 14, 0.58);
+      border-radius: 12px;
+      padding: 18px;
+      animation: panel-in 260ms ease-out;
     }
 
     .title {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       font-size: 13px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
+    }
+
+    .scene-caption {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--muted);
+      background: rgba(17, 24, 37, 0.72);
+    }
+
+    .pill.lounge {
+      border-color: rgba(102, 224, 190, 0.45);
+      color: #abefdc;
+    }
+
+    .pill.work {
+      border-color: rgba(124, 217, 255, 0.45);
+      color: #bde9ff;
     }
 
     canvas {
@@ -1491,22 +2083,40 @@ function getWebviewHtml(webview: vscode.Webview): string {
       border: 2px solid var(--line);
       image-rendering: pixelated;
       image-rendering: crisp-edges;
-      background: #0e1118;
+      background: #16243e;
+    }
+
+    .git-strip {
+      margin-top: 10px;
+      border: 2px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: rgba(17, 24, 37, 0.78);
+      display: grid;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .git-strip strong {
+      color: #d7e6ff;
+      font-size: 12px;
     }
 
     .footer {
-      margin-top: 10px;
+      margin-top: 12px;
       font-size: 12px;
-      color: #b7bfd6;
+      color: var(--muted);
     }
 
     .agent-list {
       margin-top: 12px;
       border: 2px solid var(--line);
-      background: rgba(20, 24, 34, 0.8);
+      background: rgba(17, 24, 37, 0.74);
       padding: 8px;
       display: grid;
       gap: 6px;
+      border-radius: 8px;
     }
 
     .agent-item {
@@ -1532,8 +2142,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .event-log {
       margin-top: 10px;
       border: 2px solid var(--line);
-      background: rgba(20, 24, 34, 0.82);
+      background: rgba(17, 24, 37, 0.78);
       padding: 8px;
+      border-radius: 8px;
     }
 
     .event-log-title {
@@ -1547,7 +2158,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     .event-log ul {
       margin: 0;
       padding-left: 16px;
-      max-height: 120px;
+      max-height: 136px;
       overflow: auto;
       font-size: 11px;
       line-height: 1.35;
@@ -1556,6 +2167,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     .event-log li {
       margin-bottom: 4px;
+    }
+
+    @keyframes panel-in {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
   </style>
 </head>
@@ -1566,6 +2188,15 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <span id="status">IDLE</span>
     </div>
     <canvas id="scene" width="320" height="180"></canvas>
+    <div class="scene-caption">
+      <span class="pill lounge">Lounge: idle agents praten hier</span>
+      <span class="pill work">Werkvloer: actieve agents werken hier</span>
+    </div>
+    <div class="git-strip">
+      <strong id="git-branch">git: laden...</strong>
+      <span id="git-counts">staged 0 | unstaged 0 | conflicts 0</span>
+      <span id="git-message">Git monitoring wordt geladen.</span>
+    </div>
     <div class="agent-list">
       <div class="agent-item">
         <strong>Scout</strong>
@@ -1588,7 +2219,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       <ul id="event-log-list"></ul>
     </div>
     <div class="footer">
-      Tip: gebruik <code>@pixel /show</code> in Copilot Chat. Dit panel gebruikt echte extension-events en best-effort Copilot-signalen via publieke API's.
+      Tip: gebruik <code>@pixel /show</code>. Een agent gaat naar de werkvloer bij activiteit en keert na 60s zonder nieuwe events terug naar idle in de lounge.
     </div>
   </div>
 
@@ -1597,37 +2228,161 @@ function getWebviewHtml(webview: vscode.Webview): string {
     const canvas = document.getElementById('scene');
     const status = document.getElementById('status');
     const logList = document.getElementById('event-log-list');
-    const ctx = canvas.getContext('2d');
+    const gitBranchEl = document.getElementById('git-branch');
+    const gitCountsEl = document.getElementById('git-counts');
+    const gitMessageEl = document.getElementById('git-message');
+    const ctx = canvas ? canvas.getContext('2d') : null;
+    const CANVAS_W = (canvas && canvas.width) ? canvas.width : 320;
+    const CANVAS_H = (canvas && canvas.height) ? canvas.height : 180;
 
     if (!ctx) {
-      status.textContent = 'CANVAS ERROR';
-      throw new Error('Canvas context niet beschikbaar.');
+      if (status) { status.textContent = 'CANVAS ERROR - herlaad het panel'; }
     }
 
-    const laneYs = [106, 122, 138];
-    const walkBounds = {
-      left: 10,
-      right: canvas.width - 22
+    const loungeLaneYs = [124, 138, 152];
+    const workLaneYs = [94, 112, 130];
+    const loungeBounds = {
+      left: 16,
+      right: 132
+    };
+    const workBounds = {
+      left: 174,
+      right: CANVAS_W - 20
+    };
+    const INACTIVITY_LIMIT_MS = 60000;
+    const AGENT_PERSONALITIES = {
+      scout: {
+        idleLines: [
+          'ik scan nog even de context.',
+          'waar zit de volgende winst?',
+          'commit-plan wordt scherp gezet.',
+          "ik spot alvast de risico's.",
+          'nog een snelle map-check.'
+        ],
+        workFallback: 'context en impact checken',
+        loungeSpeed: 0.95,
+        workSpeed: 1.05,
+        driftAmp: 0.14,
+        driftFreq: 0.0019,
+        poseAmp: 0.22,
+        poseFreq: 0.0036
+      },
+      builder: {
+        idleLines: [
+          'ik zet alvast een patch op.',
+          'nog 1 refactor en door.',
+          'de build moet strak blijven.',
+          'ik warm de compiler op.',
+          'ready voor de volgende feature.'
+        ],
+        workFallback: 'implementatie uitwerken',
+        loungeSpeed: 1.02,
+        workSpeed: 1.18,
+        driftAmp: 0.09,
+        driftFreq: 0.0015,
+        poseAmp: 0.16,
+        poseFreq: 0.0042
+      },
+      reviewer: {
+        idleLines: [
+          'ik hou de checks paraat.',
+          'randgevallen eerst, altijd.',
+          'ik kijk nog naar regressies.',
+          'lint en tests blijven heilig.',
+          'klaar voor een snelle review.'
+        ],
+        workFallback: 'validatie en checks draaien',
+        loungeSpeed: 0.88,
+        workSpeed: 0.97,
+        driftAmp: 0.07,
+        driftFreq: 0.0013,
+        poseAmp: 0.13,
+        poseFreq: 0.0029
+      }
     };
 
     const agents = [
-      { id: 'scout', name: 'Scout', x: 42, y: laneYs[0], vx: 0.46, frame: 0, bob: 0.3, color: '#69f0c4', task: 'wacht op event', status: 'idle', progress: 0, lane: 0, lastEventAt: Date.now() },
-      { id: 'builder', name: 'Builder', x: 132, y: laneYs[1], vx: -0.41, frame: 0, bob: 1.4, color: '#ffd166', task: 'wacht op event', status: 'idle', progress: 0, lane: 1, lastEventAt: Date.now() },
-      { id: 'reviewer', name: 'Reviewer', x: 232, y: laneYs[2], vx: 0.52, frame: 0, bob: 2.5, color: '#ff6f91', task: 'wacht op event', status: 'idle', progress: 0, lane: 2, lastEventAt: Date.now() }
+      { id: 'scout', name: 'Scout', x: 42, y: loungeLaneYs[0], vx: 0.46, frame: 0, bob: 0.3, color: '#69f0c4', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 0, zone: 'lounge', lastEventAt: Date.now() },
+      { id: 'builder', name: 'Builder', x: 92, y: loungeLaneYs[1], vx: -0.41, frame: 0, bob: 1.4, color: '#ffd166', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 1, zone: 'lounge', lastEventAt: Date.now() },
+      { id: 'reviewer', name: 'Reviewer', x: 126, y: loungeLaneYs[2], vx: 0.52, frame: 0, bob: 2.5, color: '#ff6f91', task: 'wacht in lounge', status: 'idle', progress: 0, lane: 2, zone: 'lounge', lastEventAt: Date.now() }
     ];
 
     const agentById = new Map();
     for (const agent of agents) {
+      applyZoneFromStatus(agent);
       agentById.set(agent.id, agent);
     }
 
     const eventLog = [];
+
+    function renderGitState(git) {
+      if (!git) {
+        gitBranchEl.textContent = 'git: onbekend';
+        gitCountsEl.textContent = 'staged 0 | unstaged 0 | conflicts 0';
+        gitMessageEl.textContent = 'Geen git-data ontvangen.';
+        return;
+      }
+
+      gitBranchEl.textContent = 'git: ' + (git.branch || '-');
+      gitCountsEl.textContent =
+        'staged ' + (git.staged || 0) +
+        ' | unstaged ' + (git.unstaged || 0) +
+        ' | conflicts ' + (git.conflicts || 0) +
+        ' | ahead ' + (git.ahead || 0) +
+        ' | behind ' + (git.behind || 0);
+      gitMessageEl.textContent = git.message || 'Git monitoring actief.';
+    }
 
     function shorten(value, maxLength) {
       if (!value) {
         return '';
       }
       return value.length <= maxLength ? value : value.slice(0, maxLength - 1) + '...';
+    }
+
+    function isActiveStatus(statusValue) {
+      return statusValue === 'working' || statusValue === 'completed' || statusValue === 'error';
+    }
+
+    function applyZoneFromStatus(agent) {
+      const active = isActiveStatus(agent.status);
+      agent.zone = active ? 'work' : 'lounge';
+
+      const bounds = active ? workBounds : loungeBounds;
+      const lanes = active ? workLaneYs : loungeLaneYs;
+
+      agent.lane = clamp(agent.lane, 0, lanes.length - 1);
+      agent.x = clamp(agent.x, bounds.left, bounds.right);
+      if (!active) {
+        agent.progress = 0;
+      }
+    }
+
+    function getIdleLine(agent, nowMs) {
+      const lines = AGENT_PERSONALITIES[agent.id].idleLines;
+      const tick = Math.floor(nowMs / 4200);
+      const offset = agent.id.length * 3 + agent.lane;
+      const index = (tick + offset) % lines.length;
+      return lines[index];
+    }
+
+    function getActiveLine(agent) {
+      const fallback = AGENT_PERSONALITIES[agent.id].workFallback;
+      const core = shorten(agent.task || fallback, 22);
+
+      if (agent.status === 'completed') {
+        return 'klaar: ' + core;
+      }
+      if (agent.status === 'error') {
+        return 'let op: ' + core;
+      }
+      if (agent.id === 'scout') {
+        return 'scan: ' + core;
+      }
+      if (agent.id === 'builder') {
+        return 'bouwt: ' + core;
+      }
+      return 'checkt: ' + core;
     }
 
     function setStatusLine(text) {
@@ -1638,6 +2393,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
       let working = 0;
       let completed = 0;
       let errors = 0;
+      let idle = 0;
 
       for (const agent of agents) {
         if (agent.status === 'working') {
@@ -1646,15 +2402,17 @@ function getWebviewHtml(webview: vscode.Webview): string {
           completed += 1;
         } else if (agent.status === 'error') {
           errors += 1;
+        } else {
+          idle += 1;
         }
       }
 
-      if (working === 0 && completed === 0 && errors === 0) {
-        setStatusLine('IDLE');
+      if (working === 0 && completed === 0 && errors === 0 && idle === agents.length) {
+        setStatusLine('IDLE | lounge chat actief');
         return;
       }
 
-      setStatusLine(working + ' actief | ' + completed + ' klaar | ' + errors + ' fout');
+      setStatusLine(working + ' actief | ' + completed + ' klaar | ' + errors + ' fout | ' + idle + ' lounge');
     }
 
     function renderAgentRows() {
@@ -1662,10 +2420,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
         const taskEl = document.getElementById('task-' + agent.id);
         const stateEl = document.getElementById('state-' + agent.id);
         if (taskEl) {
-          taskEl.textContent = shorten(agent.task || 'wacht op event', 58);
+          taskEl.textContent = shorten(agent.task || 'wacht in lounge', 58);
         }
         if (stateEl) {
-          stateEl.textContent = agent.status + ' ' + agent.progress + '%';
+          const location = agent.zone === 'work' ? 'werkplek' : 'lounge';
+          stateEl.textContent = agent.status + ' ' + agent.progress + '% ' + location;
         }
       }
     }
@@ -1696,6 +2455,10 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function applyAgentUpdate(event) {
+      if (event.git) {
+        renderGitState(event.git);
+      }
+
       if (!event.agentId) {
         return;
       }
@@ -1716,6 +2479,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
         agent.task = event.summary;
       }
       agent.lastEventAt = event.timestamp || Date.now();
+      applyZoneFromStatus(agent);
       renderAgentRows();
       updateStatusFromAgents();
     }
@@ -1724,6 +2488,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (!snapshot) {
         return;
       }
+
+      renderGitState(snapshot.git);
 
       if (snapshot.agents) {
         for (const id of Object.keys(snapshot.agents)) {
@@ -1736,6 +2502,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
           agent.status = incoming.status || agent.status;
           agent.progress = typeof incoming.progress === 'number' ? incoming.progress : agent.progress;
           agent.lastEventAt = incoming.lastEventAt || agent.lastEventAt;
+          applyZoneFromStatus(agent);
         }
       }
 
@@ -1748,7 +2515,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
       renderAgentRows();
       renderEventLog();
-      setStatusLine(snapshot.statusLine || 'IDLE');
+      updateStatusFromAgents();
     }
 
     window.addEventListener('message', (rawEvent) => {
@@ -1773,10 +2540,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const now = Date.now();
       let changed = false;
       for (const agent of agents) {
-        if (agent.status === 'working' && now - agent.lastEventAt > 12000) {
+        if (agent.status !== 'idle' && now - agent.lastEventAt >= INACTIVITY_LIMIT_MS) {
           agent.status = 'idle';
           agent.progress = 0;
-          agent.task = 'wacht op event';
+          agent.task = 'wacht in lounge';
+          applyZoneFromStatus(agent);
           changed = true;
         }
       }
@@ -1809,54 +2577,72 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function drawOfficeScene(nowMs) {
-      ctx.fillStyle = '#131824';
-      ctx.fillRect(0, 0, canvas.width, 74);
+      const splitX = 158;
 
-      for (let i = 0; i < 4; i += 1) {
-        const wx = 14 + i * 76;
-        ctx.fillStyle = '#293753';
-        ctx.fillRect(wx, 12, 56, 28);
-        ctx.fillStyle = '#3f567f';
-        ctx.fillRect(wx + 2, 14, 52, 24);
-        ctx.fillStyle = '#6fa8dc';
-        ctx.fillRect(wx + 4, 16, 48, 5);
+      // Ceiling
+      ctx.fillStyle = '#0d1520';
+      ctx.fillRect(0, 0, CANVAS_W, 74);
+
+      // Pulsing zone accent strips below ceiling
+      const loungePulse = 0.55 + Math.sin(nowMs * 0.002) * 0.3;
+      const workPulse = 0.52 + Math.cos(nowMs * 0.0025) * 0.3;
+      ctx.fillStyle = 'rgba(80, 220, 140,' + loungePulse.toFixed(2) + ')';
+      ctx.fillRect(18, 8, 110, 4);
+      ctx.fillStyle = 'rgba(80, 180, 255,' + workPulse.toFixed(2) + ')';
+      ctx.fillRect(186, 8, 118, 4);
+
+      // Lounge floor - clearly green-tinted
+      ctx.fillStyle = '#0e2218';
+      ctx.fillRect(8, 74, splitX - 12, 106);
+      // Lounge floor header band
+      ctx.fillStyle = '#1a4028';
+      ctx.fillRect(8, 74, splitX - 12, 16);
+
+      // Work floor - clearly blue-tinted
+      ctx.fillStyle = '#0e1d30';
+      ctx.fillRect(splitX, 74, CANVAS_W - splitX, 106);
+      // Work floor header band
+      ctx.fillStyle = '#183554';
+      ctx.fillRect(splitX, 74, CANVAS_W - splitX, 16);
+
+      ctx.fillStyle = '#2d4f63';
+      ctx.fillRect(20, 86, 106, 18);
+      ctx.fillStyle = '#40667d';
+      ctx.fillRect(24, 90, 98, 5);
+      ctx.fillStyle = '#203243';
+      ctx.fillRect(40, 104, 66, 7);
+      ctx.fillRect(46, 111, 52, 2);
+
+      ctx.fillStyle = '#4a8f69';
+      ctx.fillRect(14, 150, 8, 10);
+      ctx.fillRect(136, 118, 8, 10);
+      ctx.fillStyle = '#2a5f3d';
+      ctx.fillRect(15, 160, 6, 2);
+      ctx.fillRect(137, 128, 6, 2);
+
+      for (let i = 0; i < 3; i += 1) {
+        drawDesk(178, 84 + i * 24, nowMs * 0.004 + i * 5.2);
       }
 
-      for (let i = 0; i < 5; i += 1) {
-        const lightX = 24 + i * 62;
-        const pulse = 0.5 + Math.sin(nowMs * 0.002 + i) * 0.35;
-        const value = 210 + Math.floor(pulse * 25);
-        ctx.fillStyle = 'rgb(' + value + ', ' + value + ', ' + (value - 20) + ')';
-        ctx.fillRect(lightX, 4, 34, 3);
-      }
+      // Divider wall
+      ctx.fillStyle = '#8ab4e8';
+      ctx.fillRect(splitX - 2, 74, 4, 106);
 
-      ctx.fillStyle = '#20283a';
-      ctx.fillRect(0, 74, canvas.width, 106);
-
-      for (let y = 76; y < canvas.height; y += 14) {
-        ctx.strokeStyle = '#2c354b';
+      // Work floor grid lines
+      for (let y = 92; y < CANVAS_H; y += 14) {
+        ctx.strokeStyle = '#1e3a5c';
         ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
+        ctx.moveTo(splitX + 2, y);
+        ctx.lineTo(CANVAS_W, y);
         ctx.stroke();
       }
 
-      for (let x = 10; x < canvas.width; x += 50) {
-        drawDesk(x, 78, nowMs * 0.004 + x);
-        drawDesk(x + 12, 148, nowMs * 0.003 + x * 0.5);
-      }
-
-      ctx.fillStyle = '#2d3952';
-      for (const laneY of laneYs) {
-        ctx.fillRect(0, laneY + 12, canvas.width, 2);
-      }
-
-      ctx.fillStyle = '#3f8d5a';
-      ctx.fillRect(5, 146, 8, 10);
-      ctx.fillRect(canvas.width - 14, 98, 8, 10);
-      ctx.fillStyle = '#2a5f3d';
-      ctx.fillRect(6, 156, 6, 2);
-      ctx.fillRect(canvas.width - 13, 108, 6, 2);
+      // Zone labels (10px, clearly readable)
+      ctx.font = 'bold 9px monospace';
+      ctx.fillStyle = '#6ee8a8';
+      ctx.fillText('LOUNGE', 18, 70);
+      ctx.fillStyle = '#7ecfff';
+      ctx.fillText('WERKVLOER', 184, 70);
     }
 
     function colorForStatus(agent) {
@@ -1866,23 +2652,46 @@ function getWebviewHtml(webview: vscode.Webview): string {
       if (agent.status === 'completed') {
         return '#68d89a';
       }
-      if (agent.status === 'idle') {
-        return '#7c88a5';
-      }
       return agent.color;
+    }
+
+    function limbPalette(agent) {
+      if (agent.id === 'scout') {
+        return { arm: '#aef0dd', hand: '#79d9c1', boot: '#63bda7' };
+      }
+      if (agent.id === 'builder') {
+        return { arm: '#ffe3aa', hand: '#ffd27a', boot: '#cda24f' };
+      }
+      return { arm: '#ffd3de', hand: '#ff9eb8', boot: '#c8748f' };
     }
 
     function drawAgentBlock(agent, nowMs) {
       const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
       const x = Math.floor(agent.x);
       const y = Math.floor(agent.y + wobble);
-      const step = agent.frame % 16 < 8 ? 0 : 1;
+      const cadence = agent.id === 'builder' ? 14 : agent.id === 'reviewer' ? 18 : 16;
+      const step = agent.frame % cadence < cadence / 2 ? 0 : 1;
+      const palette = limbPalette(agent);
 
       ctx.fillStyle = '#2f3650';
       ctx.fillRect(x - 1, y - 1, 14, 14);
 
       ctx.fillStyle = colorForStatus(agent);
       ctx.fillRect(x, y, 12, 12);
+
+      ctx.fillStyle = palette.arm;
+      ctx.fillRect(x - 2, y + 5, 2, 3);
+      ctx.fillRect(x + 12, y + 5, 2, 3);
+      ctx.fillStyle = palette.hand;
+      ctx.fillRect(x - 2, y + 8, 2, 1);
+      ctx.fillRect(x + 12, y + 8, 2, 1);
+
+      if (agent.status === 'idle' && agent.id === 'scout') {
+        ctx.fillRect(x + 12, y + 4, 2, 1);
+      }
+      if (agent.status === 'idle' && agent.id === 'reviewer') {
+        ctx.fillRect(x + 4, y + 9, 4, 1);
+      }
 
       ctx.fillStyle = '#f6f7ff';
       ctx.fillRect(x + 3, y + 3, 2, 2);
@@ -1891,9 +2700,18 @@ function getWebviewHtml(webview: vscode.Webview): string {
       ctx.fillStyle = '#202534';
       ctx.fillRect(x + 4, y + 8, 4, 1);
 
-      ctx.fillStyle = '#2f3650';
+      ctx.fillStyle = palette.boot;
       ctx.fillRect(x + 2, y + 12 + step, 2, 2);
       ctx.fillRect(x + 8, y + 13 - step, 2, 2);
+      ctx.fillStyle = '#ebf4ff';
+      ctx.fillRect(x + 2, y + 12 + step, 1, 1);
+      ctx.fillRect(x + 8, y + 13 - step, 1, 1);
+
+      if (agent.zone === 'work' && agent.status === 'working') {
+        const blink = Math.sin(nowMs * 0.02 + agent.bob) > 0 ? '#9ee7ff' : '#4f6b8f';
+        ctx.fillStyle = blink;
+        ctx.fillRect(x + 2, y - 3, 8, 1);
+      }
     }
 
     function drawSpeechCloud(agent, nowMs) {
@@ -1902,7 +2720,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
       const blockY = Math.floor(agent.y + wobble);
 
       ctx.font = '8px monospace';
-      const label = agent.name + ': ' + shorten(agent.task || 'wacht op event', 26);
+      const bubbleText = agent.status === 'idle' ? getIdleLine(agent, nowMs) : getActiveLine(agent);
+      const label = agent.name + ': ' + bubbleText;
       const textWidth = Math.ceil(ctx.measureText(label).width);
       const cloudWidth = Math.max(74, textWidth + 10);
       const cloudHeight = 13;
@@ -1921,26 +2740,43 @@ function getWebviewHtml(webview: vscode.Webview): string {
       ctx.fillRect(blockX + 5, cloudY + cloudHeight, 3, 2);
       ctx.fillRect(blockX + 6, cloudY + cloudHeight + 2, 1, 2);
 
-      ctx.fillStyle = '#202534';
+      ctx.fillStyle = '#1f2738';
       ctx.fillText(label, cloudX + 5, cloudY + 9);
     }
 
     function tickAgent(agent, nowMs) {
-      agent.x += agent.vx;
-      const targetY = laneYs[agent.lane];
-      agent.y += (targetY - agent.y) * 0.08;
+      const inWorkZone = agent.zone === 'work';
+      const personality = AGENT_PERSONALITIES[agent.id];
+      const lanePool = inWorkZone ? workLaneYs : loungeLaneYs;
+      const bounds = inWorkZone ? workBounds : loungeBounds;
+
+      agent.lane = clamp(agent.lane, 0, lanePool.length - 1);
+
+      const speedBase = inWorkZone ? 1.1 : 0.85;
+      const speed = speedBase * (inWorkZone ? personality.workSpeed : personality.loungeSpeed);
+      agent.x += agent.vx * speed;
+      const targetY = lanePool[agent.lane];
+      agent.y += (targetY - agent.y) * (inWorkZone ? 0.09 : 0.07);
       agent.frame += 1;
 
-      if (agent.x > walkBounds.right || agent.x < walkBounds.left) {
+      if (!inWorkZone) {
+        agent.x += Math.sin(nowMs * personality.driftFreq + agent.bob) * personality.driftAmp;
+        if (agent.status === 'idle') {
+          agent.y += Math.sin(nowMs * personality.poseFreq + agent.bob) * personality.poseAmp;
+        }
+      }
+
+      if (agent.x > bounds.right || agent.x < bounds.left) {
         agent.vx *= -1;
-        const nextLane = Math.floor(Math.random() * laneYs.length);
+        agent.x = clamp(agent.x, bounds.left, bounds.right);
+        const nextLane = Math.floor(Math.random() * lanePool.length);
         agent.lane = nextLane;
       }
     }
 
     function draw() {
       const nowMs = performance.now();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
 
       drawOfficeScene(nowMs);
 
@@ -1955,10 +2791,11 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     renderAgentRows();
     renderEventLog();
+    renderGitState(null);
     updateStatusFromAgents();
     vscodeApi.postMessage({ type: 'webview-ready' });
 
-    draw();
+    if (ctx) { draw(); } else { console.error('[Pixel] canvas ctx is null - canvas not available in this webview'); }
   </script>
 </body>
 </html>`;

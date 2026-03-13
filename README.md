@@ -71,6 +71,25 @@ Als devserver wel bereikbaar is bij panel-start:
 - diagnostics updates: errors en warnings
 - VS Code tasks: gestart/afgerond inclusief exit status
 - terminal events: terminal open/close en shell command start/einde met exit code
+- git events: branch, ahead/behind, staged/unstaged/conflicts en clean/changed/conflict transitions
+
+## Git monitoring
+
+- gebruikt de publieke VS Code Git API (`vscode.git`) wanneer beschikbaar
+- kiest automatisch de repository van de actieve editor (of anders de eerste repo)
+- stuurt debounced git-state events om event-spam te vermijden
+- toont branch + change counts + statusboodschap in embedded en Vite webview UI
+
+## Agentgedrag in de scene
+
+- de scene heeft 2 zones: lounge (idle) en werkvloer (actief)
+- agents verplaatsen automatisch naar de werkvloer bij `working`, `completed` of `error`
+- na 60 seconden zonder nieuwe events gaat een agent terug naar idle in de lounge
+- typing bursts op file-wijzigingen sturen extra ritmische progress-events per agent
+- bestandsnamen sturen agent-keuze mee:
+	- docs/readme/notities -> Scout
+	- test/spec/lint/qa/diagnostic/ci -> Reviewer
+	- overig -> Builder
 
 ## Copilot dekking
 

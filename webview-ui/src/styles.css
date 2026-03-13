@@ -171,12 +171,12 @@ h1 {
 
 canvas {
   width: 100%;
-  aspect-ratio: 16 / 9;
+  aspect-ratio: 1 / 1;
   border-radius: 9px;
   border: 1px solid rgba(129, 171, 210, 0.42);
   image-rendering: pixelated;
   image-rendering: crisp-edges;
-  background: #ebf2fb;
+  background: transparent;
 }
 
 .scene-caption {

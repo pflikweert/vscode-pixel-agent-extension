@@ -1,3 +1,6 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 const VIEW_TYPE = "pixelAgent.visualizer";
@@ -12,6 +15,8 @@ const MAX_COMMAND_PREVIEW_LENGTH = 170;
 const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = false;
 const TEST_EVENT_STEP_DELAY_MS = 420;
 const AGENT_INACTIVITY_IDLE_MS = 10000;
+const MAX_AGENT_IDLE_TIMEOUT_MS = 45000;
+const ANALYSIS_IDLE_HOLD_MS = 30000;
 const MIN_AGENT_IDLE_MS = 2200;
 const GIT_STATE_EVENT_DEBOUNCE_MS = 450;
 const TYPING_BURST_IDLE_MS = 1600;
@@ -20,6 +25,14 @@ const MAX_CONTEXT_SNIPPET_LENGTH = 120;
 const MAX_EXPORTED_RESPONSE_LENGTH = 12000;
 const EXPORT_CONFIG_ROOT = "pixelAgent.copilotExport";
 const DEFAULT_EXPORT_TIMEOUT_MS = 4500;
+const CODEX_IMPORT_CONFIG_ROOT = "pixelAgent.codexImport";
+const DEFAULT_CODEX_IMPORT_POLL_MS = 1200;
+const MAX_CODEX_EVENT_FINGERPRINTS = 400;
+const CODEX_NATIVE_POLL_MS = 1000;
+const CODEX_SESSION_INDEX = "session_index.jsonl";
+const CODEX_SESSIONS_DIR = "sessions";
+const CODEX_ARCHIVED_DIR = "archived_sessions";
+const CODEX_AGENT_ID: AgentId = "builder";
 
 type AgentId = "scout" | "builder" | "reviewer";
 type AgentStatus = "idle" | "working" | "completed" | "error";
@@ -42,7 +55,7 @@ interface PixelRuntimeEvent {
   agentId?: AgentId;
   status?: AgentStatus;
   progress?: number;
-  source?: "local" | "copilot-export";
+  source?: "local" | "copilot-export" | "codex";
   traceId?: string;
   spanId?: string;
   model?: string;
@@ -60,6 +73,10 @@ interface RuntimeState {
   eventLog: PixelRuntimeEvent[];
   statusLine: string;
   git: GitViewState;
+}
+
+function isBossOnlyEventType(type: string): boolean {
+  return /^ops\./.test(type);
 }
 
 interface GitViewState {
@@ -166,6 +183,50 @@ interface CopilotExportPayload {
   };
 }
 
+interface CodexImportConfig {
+  enabled: boolean;
+  filePath: string;
+  pollMs: number;
+}
+
+interface CodexImportRuntime {
+  config: CodexImportConfig;
+  offset: number;
+  remainder: string;
+  busy: boolean;
+  missingNotified: boolean;
+  readyEmitted: boolean;
+  lastError?: string;
+  seenFingerprints: Set<string>;
+  fingerprintQueue: string[];
+  poller?: NodeJS.Timeout;
+}
+
+interface CodexNativeSessionEntry {
+  id: string;
+  thread_name: string;
+  updated_at: string;
+}
+
+interface CodexNativeRuntime {
+  codexHome: string;
+  // session_index.jsonl polling state
+  indexOffset: number;
+  indexRemainder: string;
+  // known sessions: id → updated_at ms
+  knownSessions: Map<string, number>;
+  // currently tracked rollout
+  activeSessionId?: string;
+  activeRolloutPath?: string;
+  rolloutOffset: number;
+  rolloutRemainder: string;
+  // dedup
+  seenFingerprints: Set<string>;
+  fingerprintQueue: string[];
+  busy: boolean;
+  poller?: NodeJS.Timeout;
+}
+
 type ExtensionToWebviewMessage =
   | { type: "pixel.snapshot"; payload: RuntimeState }
   | { type: "pixel.event"; payload: PixelRuntimeEvent };
@@ -184,6 +245,123 @@ const AGENT_LABELS: Record<AgentId, string> = {
   builder: "Builder",
   reviewer: "Reviewer",
 };
+
+function inferAgentFromText(...parts: Array<string | undefined>): AgentId {
+  const lower = parts
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" ")
+    .toLowerCase();
+
+  if (!lower) {
+    return nextBalancedAgent();
+  }
+
+  if (
+    /\b(deploy|deployment|release|publish|ship|rollout|smoke|verify|validate|approval|approve|audit|qa|test|lint|eslint|typecheck|diagnostic|review|check|ci|cd|pipeline|healthcheck|regression|integration|e2e)\b/.test(
+      lower,
+    )
+  ) {
+    return "reviewer";
+  }
+
+  if (
+    /\b(scan|analy|analyse|explor|inspect|research|context|plan|read|diff|status|log|docs?|readme|explain|investigate|search|prompt|question|discover)\b/.test(
+      lower,
+    )
+  ) {
+    return "scout";
+  }
+
+  if (
+    /\b(write|patch|edit|implement|refactor|fix|code|build|compile|bundle|generate|create|update|install|dev|serve|start|watch|run|execute|migrate)\b/.test(
+      lower,
+    )
+  ) {
+    return "builder";
+  }
+
+  return nextBalancedAgent();
+}
+
+function inferAgentForToolActivity(
+  toolName: string,
+  input?: unknown,
+  output?: unknown,
+): AgentId {
+  const lowerTool = toolName.toLowerCase();
+  const inputText =
+    typeof input === "string"
+      ? input
+      : typeof output === "string"
+        ? output
+        : JSON.stringify(input ?? output ?? "");
+
+  if (lowerTool === "exec_command") {
+    return inferAgentForCommandLine(inputText);
+  }
+
+  if (
+    /(apply_patch|write|edit|replace|create|delete|rename|move|format)/.test(
+      lowerTool,
+    )
+  ) {
+    return "builder";
+  }
+
+  if (
+    /(test|lint|audit|check|deploy|release|publish|verify|validate)/.test(
+      lowerTool,
+    )
+  ) {
+    return "reviewer";
+  }
+
+  if (
+    /(read|search|find|grep|glob|list|open|view|fetch|status|diff|log)/.test(
+      lowerTool,
+    )
+  ) {
+    return "scout";
+  }
+
+  return inferAgentFromText(toolName, inputText);
+}
+
+function buildOpsDispatchDetail(agentId: AgentId, requestText: string): string {
+  const normalized = shorten(requestText.trim() || "nieuwe opdracht", 120);
+  if (agentId === "scout") {
+    return `Scout, verken de context en pak de vraag op: ${normalized}`;
+  }
+  if (agentId === "reviewer") {
+    return `Reviewer, check tests, deploy en risico's voor: ${normalized}`;
+  }
+  return `Builder, pak de codewijzigingen op voor: ${normalized}`;
+}
+
+function shouldExtendAgentIdleWindow(event: PixelRuntimeEvent): boolean {
+  if (!event.agentId || event.status !== "working") {
+    return false;
+  }
+
+  const combined = `${event.type} ${event.summary} ${event.detail || ""}`.toLowerCase();
+  return (
+    /codex\.reasoning|chat\.processing|explor|analy|analyse|investigat|context|plan|read|scan|search|inspect|diff|status|thinking/.test(
+      combined,
+    ) &&
+    !/chat\.completed|error|failed|done|finished/.test(combined)
+  );
+}
+
+function holdAgentBusy(agentId: AgentId, durationMs: number): void {
+  agentIdleHoldUntil.set(
+    agentId,
+    Math.max(agentIdleHoldUntil.get(agentId) || 0, Date.now() + durationMs),
+  );
+}
+
+function clearAgentBusyHold(agentId: AgentId): void {
+  agentIdleHoldUntil.delete(agentId);
+}
 
 const AGENT_BURST_PROFILES: Record<AgentId, AgentBurstProfile> = {
   scout: {
@@ -234,6 +412,7 @@ let preferredPanelMode: PanelMode = "auto";
 let panelReadyWatchdog: NodeJS.Timeout | undefined;
 let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
+const agentIdleHoldUntil = new Map<AgentId, number>();
 const lastDocumentChangeEventAt = new Map<string, number>();
 const typingBurstStates = new Map<string, TypingBurstState>();
 const balancedAgentRotation: AgentId[] = ["scout", "builder", "reviewer"];
@@ -269,7 +448,24 @@ export function activate(context: vscode.ExtensionContext) {
       const requestLabel = request.command
         ? `/${request.command}`
         : prompt || "lege prompt";
+      const visiblePrompt = prompt || requestLabel;
       const assignedAgent = pickAgentForPrompt(prompt, request.command);
+
+      emitRuntimeEvent({
+        type: "chat.userPrompt",
+        timestamp: Date.now(),
+        summary: "Gebruiker stuurt opdracht",
+        detail: visiblePrompt,
+        source: "local",
+      });
+      emitRuntimeEvent({
+        type: "ops.dispatch",
+        timestamp: Date.now(),
+        summary: `Ops AI stuurt ${AGENT_LABELS[assignedAgent]} aan`,
+        detail: buildOpsDispatchDetail(assignedAgent, visiblePrompt),
+        agentId: assignedAgent,
+        source: "local",
+      });
 
       emitRuntimeEvent({
         type: "chat.received",
@@ -436,6 +632,8 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(participant);
   registerRuntimeListeners(context);
   void registerGitRuntimeListeners(context);
+  registerCodexImport(context);
+  registerCodexNative(context);
 
   emitRuntimeEvent({
     type: "extension.activated",
@@ -665,6 +863,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
 
   const terminalOpenListener = vscode.window.onDidOpenTerminal((terminal) => {
     const agentId = nextBalancedAgent();
+    const source = detectAutomationSource(terminal.name);
     emitRuntimeEvent({
       type: "terminal.opened",
       timestamp: Date.now(),
@@ -673,12 +872,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       agentId,
       status: "working",
       progress: 20,
+      source,
     });
     scheduleAgentIdle(agentId, 5000);
   });
 
   const terminalCloseListener = vscode.window.onDidCloseTerminal((terminal) => {
     const agentId = nextBalancedAgent();
+    const source = detectAutomationSource(terminal.name);
     emitRuntimeEvent({
       type: "terminal.closed",
       timestamp: Date.now(),
@@ -687,6 +888,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       agentId,
       status: "completed",
       progress: 100,
+      source,
     });
     scheduleAgentIdle(agentId, 4500);
   });
@@ -712,6 +914,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
         );
         const terminalName = event.terminal.name || "terminal";
         const agentId = inferAgentForCommandLine(command);
+        const source = detectAutomationSource(terminalName, command);
         const friendly = buildFriendlyTerminalMessage(
           command,
           terminalName,
@@ -726,6 +929,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
           agentId,
           status: "working",
           progress: 65,
+          source,
         });
         scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
       })
@@ -738,6 +942,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
         );
         const terminalName = event.terminal.name || "terminal";
         const exitCode = event.exitCode;
+        const source = detectAutomationSource(terminalName, command);
 
         const status: AgentStatus =
           exitCode === undefined
@@ -761,6 +966,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
           agentId,
           status,
           progress: 100,
+          source,
         });
         scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
       })
@@ -981,6 +1187,1156 @@ function getCopilotExportConfig(): CopilotExportConfig {
   };
 }
 
+function getCodexImportConfig(): CodexImportConfig {
+  const config = vscode.workspace.getConfiguration(CODEX_IMPORT_CONFIG_ROOT);
+  const pollMs = config.get<number>("pollMs", DEFAULT_CODEX_IMPORT_POLL_MS);
+
+  return {
+    enabled: config.get<boolean>("enabled", false),
+    filePath: (config.get<string>("filePath", "") || "").trim(),
+    pollMs: Math.max(300, Math.min(60000, Math.round(pollMs))),
+  };
+}
+
+function createCodexImportRuntime(
+  config: CodexImportConfig,
+  previous?: CodexImportRuntime,
+): CodexImportRuntime {
+  return {
+    config,
+    offset:
+      previous && previous.config.filePath === config.filePath
+        ? previous.offset
+        : 0,
+    remainder:
+      previous && previous.config.filePath === config.filePath
+        ? previous.remainder
+        : "",
+    busy: false,
+    missingNotified: false,
+    readyEmitted: false,
+    lastError: undefined,
+    seenFingerprints:
+      previous && previous.config.filePath === config.filePath
+        ? previous.seenFingerprints
+        : new Set<string>(),
+    fingerprintQueue:
+      previous && previous.config.filePath === config.filePath
+        ? previous.fingerprintQueue
+        : [],
+    poller: undefined,
+  };
+}
+
+// ── Auto-discovery of ~/.codex (Codex – OpenAI's coding agent) ──────────────
+
+function resolveCodexHome(): string {
+  return process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+}
+
+function createCodexNativeRuntime(codexHome: string): CodexNativeRuntime {
+  return {
+    codexHome,
+    indexOffset: 0,
+    indexRemainder: "",
+    knownSessions: new Map(),
+    rolloutOffset: 0,
+    rolloutRemainder: "",
+    seenFingerprints: new Set(),
+    fingerprintQueue: [],
+    busy: false,
+    poller: undefined,
+  };
+}
+
+function registerCodexNative(context: vscode.ExtensionContext) {
+  const codexHome = resolveCodexHome();
+
+  // Check if ~/.codex exists; if not, skip silently.
+  fs.stat(codexHome).then(
+    () => {
+      const rt = createCodexNativeRuntime(codexHome);
+      rt.poller = setInterval(() => {
+        void pollCodexNative(rt);
+      }, CODEX_NATIVE_POLL_MS);
+      void pollCodexNative(rt);
+
+      context.subscriptions.push({
+        dispose: () => {
+          if (rt.poller) {
+            clearInterval(rt.poller);
+          }
+        },
+      });
+    },
+    () => {
+      // codexHome not found — not installed, nothing to do
+    },
+  );
+}
+
+async function pollCodexNative(rt: CodexNativeRuntime): Promise<void> {
+  if (rt.busy) {
+    return;
+  }
+  rt.busy = true;
+  try {
+    await pollCodexSessionIndex(rt);
+    await pollCodexActiveRollout(rt);
+  } catch {
+    // ignore transient IO errors
+  } finally {
+    rt.busy = false;
+  }
+}
+
+async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
+  const indexPath = path.join(rt.codexHome, CODEX_SESSION_INDEX);
+  let stat: { size: number };
+  try {
+    stat = await fs.stat(indexPath);
+  } catch {
+    return;
+  }
+
+  if (stat.size <= rt.indexOffset) {
+    // File shrank — reset and re-read everything
+    if (stat.size < rt.indexOffset) {
+      rt.indexOffset = 0;
+      rt.indexRemainder = "";
+    }
+    return;
+  }
+
+  const chunk = await readBytesAt(indexPath, rt.indexOffset, stat.size - rt.indexOffset);
+  rt.indexOffset = stat.size;
+
+  const text = rt.indexRemainder + chunk;
+  const lines = text.split("\n");
+  rt.indexRemainder = lines.pop() ?? "";
+
+  let latestUpdatedMs = -1;
+  let latestEntry: CodexNativeSessionEntry | undefined;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let entry: CodexNativeSessionEntry;
+    try {
+      entry = JSON.parse(trimmed) as CodexNativeSessionEntry;
+    } catch {
+      continue;
+    }
+
+    if (!entry.id || !entry.updated_at) {
+      continue;
+    }
+
+    const updatedMs = new Date(entry.updated_at).getTime();
+    if (isNaN(updatedMs)) {
+      continue;
+    }
+
+    const prevMs = rt.knownSessions.get(entry.id) ?? -1;
+    rt.knownSessions.set(entry.id, updatedMs);
+
+    // Track the most recently updated session across all lines
+    if (updatedMs > latestUpdatedMs) {
+      latestUpdatedMs = updatedMs;
+      latestEntry = entry;
+    }
+
+    if (updatedMs > prevMs && entry.id !== rt.activeSessionId) {
+      // Emit a session-started or session-updated event
+      emitRuntimeEvent({
+        type: "codex.session",
+        timestamp: updatedMs,
+        summary: entry.thread_name || `Codex sessie ${entry.id.slice(0, 8)}`,
+        detail: `Codex: ${entry.thread_name || entry.id}`,
+        agentId: "scout",
+        status: "working",
+        progress: 0,
+        source: "codex",
+      });
+    }
+  }
+
+  // If the most recent session changed, start tracking its rollout
+  if (latestEntry && latestEntry.id !== rt.activeSessionId) {
+    const rolloutPath = await findCodexRolloutPath(rt.codexHome, latestEntry.id);
+    if (rolloutPath) {
+      rt.activeSessionId = latestEntry.id;
+      rt.activeRolloutPath = rolloutPath;
+      rt.rolloutOffset = 0;
+      rt.rolloutRemainder = "";
+    }
+  }
+}
+
+async function findCodexRolloutPath(
+  codexHome: string,
+  sessionId: string,
+): Promise<string | undefined> {
+  // Search sessions/YYYY/MM/DD/ directories (most recent first) then archived_sessions/
+  const sessionRoot = path.join(codexHome, CODEX_SESSIONS_DIR);
+  const archivedRoot = path.join(codexHome, CODEX_ARCHIVED_DIR);
+
+  // Scan sessions subdirectories newest first (YYYY/MM/DD)
+  try {
+    const years = (await fs.readdir(sessionRoot)).sort().reverse();
+    for (const year of years) {
+      const yearDir = path.join(sessionRoot, year);
+      let months: string[];
+      try {
+        months = (await fs.readdir(yearDir)).sort().reverse();
+      } catch {
+        continue;
+      }
+      for (const month of months) {
+        const monthDir = path.join(yearDir, month);
+        let days: string[];
+        try {
+          days = (await fs.readdir(monthDir)).sort().reverse();
+        } catch {
+          continue;
+        }
+        for (const day of days) {
+          const dayDir = path.join(monthDir, day);
+          let files: string[];
+          try {
+            files = await fs.readdir(dayDir);
+          } catch {
+            continue;
+          }
+          const match = files.find(
+            (f) => f.endsWith(".jsonl") && f.includes(sessionId),
+          );
+          if (match) {
+            return path.join(dayDir, match);
+          }
+        }
+      }
+    }
+  } catch {
+    // sessions dir missing or unreadable
+  }
+
+  // Fallback: archived_sessions/
+  try {
+    const files = await fs.readdir(archivedRoot);
+    const match = files.find((f) => f.endsWith(".jsonl") && f.includes(sessionId));
+    if (match) {
+      return path.join(archivedRoot, match);
+    }
+  } catch {
+    // archived dir missing or unreadable
+  }
+
+  return undefined;
+}
+
+async function pollCodexActiveRollout(rt: CodexNativeRuntime): Promise<void> {
+  if (!rt.activeRolloutPath) {
+    return;
+  }
+
+  let stat: { size: number };
+  try {
+    stat = await fs.stat(rt.activeRolloutPath);
+  } catch {
+    return;
+  }
+
+  if (stat.size <= rt.rolloutOffset) {
+    if (stat.size < rt.rolloutOffset) {
+      rt.rolloutOffset = 0;
+      rt.rolloutRemainder = "";
+    }
+    return;
+  }
+
+  const chunk = await readBytesAt(rt.activeRolloutPath, rt.rolloutOffset, stat.size - rt.rolloutOffset);
+  rt.rolloutOffset = stat.size;
+
+  const text = rt.rolloutRemainder + chunk;
+  const lines = text.split("\n");
+  rt.rolloutRemainder = lines.pop() ?? "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const fp = buildCodexNativeFingerprint(rt.activeSessionId ?? "", rt.rolloutOffset, trimmed);
+    if (rt.seenFingerprints.has(fp)) {
+      continue;
+    }
+    rememberCodexNativeFingerprint(rt, fp);
+
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const event = codexRolloutLineToEvent(record);
+    if (event) {
+      emitRuntimeEvent(event);
+    }
+  }
+}
+
+async function readBytesAt(filePath: string, offset: number, length: number): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buf = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buf, 0, length, offset);
+    return buf.slice(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function codexRolloutLineToEvent(
+  record: Record<string, unknown>,
+): PixelRuntimeEvent | undefined {
+  const ts = typeof record.timestamp === "string"
+    ? new Date(record.timestamp as string).getTime()
+    : Date.now();
+  const type = typeof record.type === "string" ? (record.type as string) : "";
+  const payload = (record.payload ?? {}) as Record<string, unknown>;
+
+  switch (type) {
+    case "session_meta": {
+      const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
+      const model = typeof payload.model_provider === "string" ? payload.model_provider : undefined;
+      const cliVersion = typeof payload.cli_version === "string" ? payload.cli_version : "";
+      return {
+        type: "codex.session_meta",
+        timestamp: ts,
+        summary: cwd ? `Codex gestart in ${path.basename(cwd)}` : "Codex sessie gestart",
+        detail: cwd || undefined,
+        agentId: "scout",
+        status: "working",
+        progress: 5,
+        source: "codex",
+        model: model ?? (cliVersion ? `codex ${cliVersion}` : undefined),
+      };
+    }
+
+    case "response_item": {
+      const item = payload as Record<string, unknown>;
+      const itemType = typeof item.type === "string" ? item.type : "";
+      const role = typeof item.role === "string" ? item.role : "";
+
+      if (itemType === "message") {
+        const textContent = extractCodexMessageText(item.content);
+        if (!textContent) {
+          return undefined;
+        }
+
+        if (role === "user") {
+          return {
+            type: "codex.userMessage",
+            timestamp: ts,
+            summary: shorten(`Gebruiker: ${textContent}`, 80),
+            detail: shorten(textContent, 240),
+            status: "working",
+            progress: 8,
+            source: "codex",
+          };
+        }
+
+        if (role !== "assistant") {
+          return undefined;
+        }
+
+        return {
+          type: "codex.response",
+          timestamp: ts,
+          summary: shorten(textContent, 80),
+          detail: shorten(textContent, 240),
+          agentId: inferAgentFromText(textContent),
+          status: "working",
+          progress: 40,
+          source: "codex",
+        };
+      }
+
+      if (itemType === "function_call") {
+        const toolName = typeof item.name === "string" ? item.name : "tool";
+        const detail = shorten(
+          buildCodexToolCallDetail(
+            toolName,
+            item.input ?? item.arguments,
+          ),
+          240,
+        );
+        return {
+          type: "codex.toolCall",
+          timestamp: ts,
+          summary: `Codex tool: ${toolName}`,
+          detail,
+          agentId: inferAgentForToolActivity(
+            toolName,
+            item.input ?? item.arguments,
+          ),
+          status: "working",
+          progress: 58,
+          source: "codex",
+        };
+      }
+
+      if (itemType === "function_call_output") {
+        const toolName = typeof item.name === "string" ? item.name : "tool";
+        return {
+          type: "codex.toolResult",
+          timestamp: ts,
+          summary: "Codex tool output",
+          detail: shorten(buildCodexToolOutputDetail(item.output), 240),
+          agentId: inferAgentForToolActivity(toolName, undefined, item.output),
+          status: "working",
+          progress: 72,
+          source: "codex",
+        };
+      }
+
+      if (itemType === "custom_tool_call") {
+        const toolName = typeof item.name === "string" ? item.name : "custom-tool";
+        const rawStatus = typeof item.status === "string" ? item.status : "";
+        const status: AgentStatus =
+          rawStatus === "completed"
+            ? "completed"
+            : rawStatus === "failed"
+              ? "error"
+              : "working";
+
+        return {
+          type: "codex.customToolCall",
+          timestamp: ts,
+          summary:
+            toolName === "apply_patch"
+              ? "Codex past bestanden aan"
+              : `Codex custom tool: ${toolName}`,
+          detail: shorten(buildCodexToolCallDetail(toolName, item.input), 240),
+          agentId: inferAgentForToolActivity(toolName, item.input),
+          status,
+          progress: status === "completed" ? 88 : 62,
+          source: "codex",
+        };
+      }
+
+      if (itemType === "custom_tool_call_output") {
+        const toolName = typeof item.name === "string" ? item.name : "custom-tool";
+        return {
+          type: "codex.customToolResult",
+          timestamp: ts,
+          summary: "Codex custom tool output",
+          detail: shorten(buildCodexToolOutputDetail(item.output), 240),
+          agentId: inferAgentForToolActivity(toolName, undefined, item.output),
+          status: "completed",
+          progress: 100,
+          source: "codex",
+        };
+      }
+
+      if (itemType === "reasoning") {
+        return {
+          type: "codex.reasoning",
+          timestamp: ts,
+          summary: "Codex denkt na",
+          detail: "Scout is context en bestanden aan het uitzoeken...",
+          agentId: "scout",
+          status: "working",
+          progress: 28,
+          source: "codex",
+        };
+      }
+
+      return undefined;
+    }
+
+    case "command": {
+      const cmd =
+        typeof payload.command === "string"
+          ? payload.command
+          : typeof payload.cmd === "string"
+          ? payload.cmd
+          : "";
+      return {
+        type: "codex.command",
+        timestamp: ts,
+        summary: cmd ? shorten(`$ ${cmd}`, 80) : "Codex voert commando uit",
+        detail: cmd || undefined,
+        agentId: cmd ? inferAgentForCommandLine(cmd) : CODEX_AGENT_ID,
+        status: "working",
+        progress: 55,
+        source: "codex",
+      };
+    }
+
+    case "exec_command_output_delta":
+    case "item/commandExecution/outputDelta":
+    case "command/exec/outputDelta": {
+      // Suppress noisy deltas; only emit infrequently if needed
+      return undefined;
+    }
+
+    case "turn_complete":
+    case "session_complete": {
+      return {
+        type: "codex.complete",
+        timestamp: ts,
+        summary: "Codex klaar",
+        agentId: "reviewer",
+        status: "completed",
+        progress: 100,
+        source: "codex",
+      };
+    }
+
+    default:
+      return undefined;
+  }
+}
+
+function extractCodexMessageText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+    .map((entry) => {
+      if (typeof entry.text === "string") {
+        return entry.text;
+      }
+
+      if (typeof entry.output_text === "string") {
+        return entry.output_text;
+      }
+
+      return "";
+    })
+    .join(" ")
+    .trim();
+}
+
+function buildCodexToolCallDetail(name: string, input: unknown): string {
+  const parsed = parseCodexToolPayload(input);
+
+  if (name === "exec_command") {
+    const cmd =
+      typeof parsed?.cmd === "string"
+        ? parsed.cmd
+        : typeof input === "string"
+          ? input
+          : "";
+    return cmd ? `$ ${cmd}` : "Terminalcommando gestart";
+  }
+
+  if (name === "apply_patch") {
+    const patchText = typeof input === "string" ? input : "";
+    const firstPathMatch = patchText.match(
+      /\*\*\* (?:Update|Add|Delete) File: ([^\n]+)/,
+    );
+    return firstPathMatch
+      ? `Patch op ${firstPathMatch[1]}`
+      : "Bestanden worden aangepast";
+  }
+
+  if (typeof parsed?.path === "string") {
+    return `${name}: ${parsed.path}`;
+  }
+
+  if (typeof input === "string" && input.trim()) {
+    return `${name}: ${shorten(input.trim(), 180)}`;
+  }
+
+  return `${name} actief`;
+}
+
+function buildCodexToolOutputDetail(output: unknown): string {
+  if (typeof output !== "string" || !output.trim()) {
+    return "Tool-output ontvangen";
+  }
+
+  const parsed = parseCodexToolPayload(output);
+  const normalized =
+    typeof parsed?.output === "string" && parsed.output.trim()
+      ? parsed.output
+      : output;
+
+  return normalized.replace(/\s*\n\s*/g, " | ").trim();
+}
+
+function parseCodexToolPayload(
+  raw: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof raw !== "string" || !raw.trim().startsWith("{")) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildCodexNativeFingerprint(sessionId: string, offset: number, line: string): string {
+  return `${sessionId}:${offset}:${line.slice(0, 80)}`;
+}
+
+function rememberCodexNativeFingerprint(rt: CodexNativeRuntime, fp: string): void {
+  rt.seenFingerprints.add(fp);
+  rt.fingerprintQueue.push(fp);
+  if (rt.fingerprintQueue.length > MAX_CODEX_EVENT_FINGERPRINTS) {
+    const evicted = rt.fingerprintQueue.shift();
+    if (evicted) {
+      rt.seenFingerprints.delete(evicted);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function registerCodexImport(context: vscode.ExtensionContext) {
+  let runtime: CodexImportRuntime | undefined;
+
+  const restart = () => {
+    if (runtime?.poller) {
+      clearInterval(runtime.poller);
+    }
+
+    const config = getCodexImportConfig();
+    if (!config.enabled || !config.filePath) {
+      runtime = undefined;
+      return;
+    }
+
+    runtime = createCodexImportRuntime(config, runtime);
+    runtime.poller = setInterval(() => {
+      if (runtime) {
+        void pollCodexImport(runtime);
+      }
+    }, config.pollMs);
+
+    void pollCodexImport(runtime);
+  };
+
+  restart();
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration(CODEX_IMPORT_CONFIG_ROOT)) {
+        restart();
+      }
+    }),
+    {
+      dispose: () => {
+        if (runtime?.poller) {
+          clearInterval(runtime.poller);
+        }
+        runtime = undefined;
+      },
+    },
+  );
+}
+
+async function pollCodexImport(runtime: CodexImportRuntime): Promise<void> {
+  if (runtime.busy) {
+    return;
+  }
+
+  runtime.busy = true;
+  try {
+    const stat = await fs.stat(runtime.config.filePath);
+
+    runtime.missingNotified = false;
+    runtime.lastError = undefined;
+    if (!runtime.readyEmitted) {
+      runtime.readyEmitted = true;
+      emitRuntimeEvent({
+        type: "codex.importReady",
+        timestamp: Date.now(),
+        summary: "Codex import actief",
+        detail: runtime.config.filePath,
+        agentId: "scout",
+        status: "working",
+        progress: 22,
+      });
+    }
+
+    if (stat.size < runtime.offset) {
+      runtime.offset = 0;
+      runtime.remainder = "";
+      emitRuntimeEvent({
+        type: "codex.importReset",
+        timestamp: Date.now(),
+        summary: "Codex import opnieuw gesynchroniseerd",
+        detail: "Importbestand is ingekort of herschreven.",
+        agentId: "scout",
+        status: "working",
+        progress: 30,
+      });
+    }
+
+    if (stat.size === runtime.offset) {
+      return;
+    }
+
+    const appendedText = await readTextRange(
+      runtime.config.filePath,
+      runtime.offset,
+      stat.size,
+    );
+    runtime.offset = stat.size;
+
+    const parsed = parseCodexChunk(`${runtime.remainder}${appendedText}`);
+    runtime.remainder = parsed.remainder;
+
+    for (const record of parsed.records) {
+      const event = codexRecordToRuntimeEvent(record);
+      if (!event) {
+        continue;
+      }
+
+      const fingerprint = buildCodexFingerprint(event);
+      if (!rememberCodexFingerprint(runtime, fingerprint)) {
+        continue;
+      }
+
+      emitRuntimeEvent(event);
+    }
+
+    if (parsed.invalidLines > 0) {
+      emitRuntimeEvent({
+        type: "codex.importParseError",
+        timestamp: Date.now(),
+        summary: "Codex import had ongeldige regels",
+        detail: `${parsed.invalidLines} regel(s) konden niet als JSON worden gelezen.`,
+        agentId: "reviewer",
+        status: "error",
+        progress: 100,
+      });
+    }
+  } catch (error) {
+    const typed = error as NodeJS.ErrnoException;
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (typed?.code === "ENOENT") {
+      if (!runtime.missingNotified) {
+        runtime.missingNotified = true;
+        emitRuntimeEvent({
+          type: "codex.importWaiting",
+          timestamp: Date.now(),
+          summary: "Codex import wacht op bestand",
+          detail: runtime.config.filePath,
+          agentId: "scout",
+          status: "working",
+          progress: 12,
+        });
+      }
+      return;
+    }
+
+    if (runtime.lastError !== message) {
+      runtime.lastError = message;
+      emitRuntimeEvent({
+        type: "codex.importFailed",
+        timestamp: Date.now(),
+        summary: "Codex import mislukt",
+        detail: message,
+        agentId: "reviewer",
+        status: "error",
+        progress: 100,
+      });
+    }
+  } finally {
+    runtime.busy = false;
+  }
+}
+
+async function readTextRange(
+  filePath: string,
+  startOffset: number,
+  endOffset: number,
+): Promise<string> {
+  const length = Math.max(0, endOffset - startOffset);
+  if (length === 0) {
+    return "";
+  }
+
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, startOffset);
+    return buffer.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseCodexChunk(text: string): {
+  records: unknown[];
+  remainder: string;
+  invalidLines: number;
+} {
+  const lines = text.split(/\r?\n/);
+  const remainder = lines.pop() ?? "";
+  const records: unknown[] = [];
+  let invalidLines = 0;
+
+  for (const line of lines) {
+    const parsed = parseCodexLine(line);
+    if (!parsed) {
+      if (line.trim().length > 0) {
+        invalidLines += 1;
+      }
+      continue;
+    }
+    records.push(...parsed);
+  }
+
+  return { records, remainder, invalidLines };
+}
+
+function parseCodexLine(line: string): unknown[] | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      Array.isArray((parsed as { events?: unknown[] }).events)
+    ) {
+      return (parsed as { events: unknown[] }).events;
+    }
+    if (parsed && typeof parsed === "object") {
+      return [parsed];
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function readStringProperty(
+  value: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function readNumberProperty(
+  value: Record<string, unknown>,
+  ...keys: string[]
+): number | undefined {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate;
+    }
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseEventTimestamp(value: Record<string, unknown>): number {
+  const numeric = readNumberProperty(value, "timestamp", "ts", "time");
+  if (typeof numeric === "number") {
+    return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  }
+
+  const text = readStringProperty(value, "timestamp", "time", "createdAt");
+  if (text) {
+    const parsed = Date.parse(text);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+
+  return Date.now();
+}
+
+function normalizeImportedStatus(value: unknown): AgentStatus | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const lower = value.toLowerCase();
+  if (["idle", "waiting", "pending"].includes(lower)) {
+    return "idle";
+  }
+  if (["working", "running", "started", "streaming", "executing", "in_progress"].includes(lower)) {
+    return "working";
+  }
+  if (["completed", "done", "finished", "success", "succeeded"].includes(lower)) {
+    return "completed";
+  }
+  if (["error", "failed", "failure"].includes(lower)) {
+    return "error";
+  }
+
+  return undefined;
+}
+
+function inferImportedStatus(record: Record<string, unknown>): AgentStatus {
+  const explicit = normalizeImportedStatus(
+    readStringProperty(record, "status", "phase", "result"),
+  );
+  if (explicit) {
+    return explicit;
+  }
+
+  if (readStringProperty(record, "error", "exception")) {
+    return "error";
+  }
+
+  const type = (readStringProperty(record, "type", "event", "kind") || "").toLowerCase();
+  if (/(failed|error|exception)/.test(type)) {
+    return "error";
+  }
+  if (/(completed|finished|done|success)/.test(type)) {
+    return "completed";
+  }
+  if (/(started|start|stream|tool|step|progress|execute|thinking)/.test(type)) {
+    return "working";
+  }
+
+  return "working";
+}
+
+function inferImportedProgress(
+  record: Record<string, unknown>,
+  status: AgentStatus,
+): number {
+  const explicit = readNumberProperty(record, "progress", "percent", "percentage");
+  if (typeof explicit === "number") {
+    return Math.max(0, Math.min(100, Math.round(explicit)));
+  }
+
+  if (status === "completed" || status === "error") {
+    return 100;
+  }
+  if (status === "idle") {
+    return 0;
+  }
+  return 55;
+}
+
+function inferImportedAgentId(
+  record: Record<string, unknown>,
+  summary: string,
+  detail: string,
+): AgentId {
+  const explicit = readStringProperty(record, "agentId", "agent", "worker");
+  if (explicit === "scout" || explicit === "builder" || explicit === "reviewer") {
+    return explicit;
+  }
+
+  const command = readStringProperty(record, "command", "cmd") || "";
+  const filePath = readStringProperty(record, "filePath", "path", "file") || "";
+  const type = readStringProperty(record, "type", "event", "kind") || "";
+
+  if (filePath) {
+    const fileAgent = inferAgentForFilePath(filePath);
+    if (fileAgent !== "builder" || /\.(md|txt|json|ya?ml)$/i.test(filePath)) {
+      return fileAgent;
+    }
+  }
+
+  if (command) {
+    return inferAgentForCommandLine(command);
+  }
+
+  return inferAgentFromText(type, summary, detail, filePath);
+}
+
+function normalizeImportedType(rawType: string): string {
+  const trimmed = rawType.trim();
+  if (!trimmed) {
+    return "codex.event";
+  }
+
+  if (/^(terminal|task|workspace|chat|copilot|git|panel|agent)\./.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("codex.")) {
+    return trimmed;
+  }
+
+  return `codex.${trimmed.replace(/\s+/g, ".")}`;
+}
+
+function buildCodexSummary(
+  record: Record<string, unknown>,
+  normalizedType: string,
+): string {
+  const explicit = readStringProperty(record, "summary", "title");
+  if (explicit) {
+    return explicit;
+  }
+
+  const tool = readStringProperty(record, "tool", "name");
+  const command = readStringProperty(record, "command", "cmd");
+  const phase = readStringProperty(record, "phase", "status");
+
+  if (command) {
+    if (/finished|completed|done/.test(normalizedType)) {
+      return "Codex commando afgerond";
+    }
+    if (/failed|error/.test(normalizedType)) {
+      return "Codex commando mislukt";
+    }
+    return "Codex commando actief";
+  }
+
+  if (tool) {
+    return `Codex tool: ${tool}`;
+  }
+
+  if (phase) {
+    return `Codex fase: ${phase}`;
+  }
+
+  return `Codex event: ${normalizedType}`;
+}
+
+function buildCodexDetail(record: Record<string, unknown>): string {
+  const parts = [
+    readStringProperty(record, "detail", "message", "description"),
+    readStringProperty(record, "command", "cmd"),
+    readStringProperty(record, "tool", "name"),
+  ].filter((value): value is string => Boolean(value));
+
+  return parts.join("\n");
+}
+
+function buildTokenUsage(record: Record<string, unknown>):
+  | {
+      prompt?: number;
+      completion?: number;
+      total?: number;
+    }
+  | undefined {
+  const usage =
+    record.tokenUsage && typeof record.tokenUsage === "object"
+      ? (record.tokenUsage as Record<string, unknown>)
+      : record.usage && typeof record.usage === "object"
+        ? (record.usage as Record<string, unknown>)
+        : undefined;
+
+  const prompt = usage
+    ? readNumberProperty(usage, "prompt", "promptTokens", "input")
+    : readNumberProperty(record, "promptTokens", "inputTokens");
+  const completion = usage
+    ? readNumberProperty(usage, "completion", "completionTokens", "output")
+    : readNumberProperty(record, "completionTokens", "outputTokens");
+  const total = usage
+    ? readNumberProperty(usage, "total", "totalTokens")
+    : readNumberProperty(record, "totalTokens");
+
+  if (
+    typeof prompt !== "number" &&
+    typeof completion !== "number" &&
+    typeof total !== "number"
+  ) {
+    return undefined;
+  }
+
+  return { prompt, completion, total };
+}
+
+function codexRecordToRuntimeEvent(record: unknown): PixelRuntimeEvent | undefined {
+  if (!record || typeof record !== "object") {
+    return undefined;
+  }
+
+  const typed = record as Record<string, unknown>;
+  const normalizedType = normalizeImportedType(
+    readStringProperty(typed, "type", "event", "kind") || "event",
+  );
+  const summary = buildCodexSummary(typed, normalizedType);
+  const detail = buildCodexDetail(typed);
+  const status = inferImportedStatus(typed);
+
+  return {
+    type: normalizedType,
+    timestamp: parseEventTimestamp(typed),
+    summary,
+    detail: detail || undefined,
+    filePath: readStringProperty(typed, "filePath", "path", "file"),
+    agentId: inferImportedAgentId(typed, summary, detail),
+    status,
+    progress: inferImportedProgress(typed, status),
+    source: "codex",
+    traceId: readStringProperty(typed, "traceId", "trace", "trace_id"),
+    spanId: readStringProperty(typed, "spanId", "span", "span_id"),
+    model: readStringProperty(typed, "model", "modelName"),
+    latencyMs: readNumberProperty(typed, "latencyMs", "durationMs", "latency"),
+    tokenUsage: buildTokenUsage(typed),
+  };
+}
+
+function buildCodexFingerprint(event: PixelRuntimeEvent): string {
+  return [
+    event.type,
+    event.timestamp,
+    event.traceId || "",
+    event.spanId || "",
+    event.summary,
+    event.detail || "",
+  ].join("|");
+}
+
+function rememberCodexFingerprint(
+  runtime: CodexImportRuntime,
+  fingerprint: string,
+): boolean {
+  if (runtime.seenFingerprints.has(fingerprint)) {
+    return false;
+  }
+
+  runtime.seenFingerprints.add(fingerprint);
+  runtime.fingerprintQueue.push(fingerprint);
+  if (runtime.fingerprintQueue.length > MAX_CODEX_EVENT_FINGERPRINTS) {
+    const removed = runtime.fingerprintQueue.shift();
+    if (removed) {
+      runtime.seenFingerprints.delete(removed);
+    }
+  }
+
+  return true;
+}
+
 function redactSensitiveText(value: string): string {
   return value.replace(
     /(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*([^\s,;]+)/gi,
@@ -1118,7 +2474,11 @@ function estimateChangedCharacters(
 
 function inferAgentForFilePath(filePath: string): AgentId {
   const lower = filePath.toLowerCase();
-  if (/(test|spec|lint|eslint|qa|diagnostic|ci)/.test(lower)) {
+  if (
+    /(test|spec|lint|eslint|qa|diagnostic|ci|\.github\/workflows|dockerfile|docker-compose|k8s|helm|terraform|pulumi|deploy|release|vercel|netlify|fly\.toml)/.test(
+      lower,
+    )
+  ) {
     return "reviewer";
   }
   if (/(readme|docs?|\.md$|changelog|notes)/.test(lower)) {
@@ -1570,15 +2930,7 @@ function pickAgentForPrompt(prompt: string, command?: string): AgentId {
   if (command === "show") {
     return "scout";
   }
-
-  const text = prompt.toLowerCase();
-  if (/review|lint|test|error|bug|diagnostic/.test(text)) {
-    return "reviewer";
-  }
-  if (/build|schrijf|write|fix|implement|code/.test(text)) {
-    return "builder";
-  }
-  return "scout";
+  return inferAgentFromText(prompt, command);
 }
 
 function nextBalancedAgent(): AgentId {
@@ -1637,6 +2989,20 @@ function describeCommandCategory(commandLine: string): string {
   return "terminal";
 }
 
+function detectAutomationSource(
+  terminalName: string,
+  commandLine?: string,
+): "local" | "codex" {
+  const haystack = `${terminalName} ${commandLine || ""}`.toLowerCase();
+
+  // Best-effort detection for Codex extension spawned terminals/commands.
+  if (/(^|\W)(codex|openai.?coding.?agent)(\W|$)/.test(haystack)) {
+    return "codex";
+  }
+
+  return "local";
+}
+
 function buildFriendlyTerminalMessage(
   commandLine: string,
   terminalName: string,
@@ -1689,25 +3055,18 @@ function buildFriendlyTerminalMessage(
 }
 
 function inferAgentForTask(taskName: string): AgentId {
-  const lower = taskName.toLowerCase();
-  if (/lint|test|review|check|diagnostic|audit|typecheck/.test(lower)) {
-    return "reviewer";
-  }
-  if (
-    /build|compile|bundle|fix|generate|pack|release|dev|serve|watch|start/.test(
-      lower,
-    )
-  ) {
-    return "builder";
-  }
-  if (/scan|analy|readme|docs?|status|log|diff/.test(lower)) {
-    return "scout";
-  }
-  return nextBalancedAgent();
+  return inferAgentFromText(taskName);
 }
 
 function inferAgentForCommandLine(commandLine: string): AgentId {
   const lower = commandLine.toLowerCase();
+  if (
+    /\b(deploy|release|publish|ship|rollout|vercel|netlify|flyctl|kubectl|helm|terraform|ansible|docker\s+(push|compose\s+up)|npm\s+publish|gh\s+workflow)\b/.test(
+      lower,
+    )
+  ) {
+    return "reviewer";
+  }
   if (/\bgit\s+(status|log|diff|show|branch|blame)\b/.test(lower)) {
     return "scout";
   }
@@ -1728,7 +3087,7 @@ function inferAgentForCommandLine(commandLine: string): AgentId {
   ) {
     return "builder";
   }
-  return nextBalancedAgent();
+  return inferAgentFromText(commandLine);
 }
 
 function sanitizeCommandPreview(commandLine: string): string {
@@ -1780,9 +3139,14 @@ function scheduleAgentIdle(
     clearTimeout(existing);
   }
 
+  const heldUntil = agentIdleHoldUntil.get(agentId) || 0;
+  const heldRemainingMs = Math.max(0, heldUntil - Date.now());
   const delayMs = Math.max(
     MIN_AGENT_IDLE_MS,
-    Math.min(timeoutMs, AGENT_INACTIVITY_IDLE_MS),
+    Math.min(
+      Math.max(timeoutMs, heldRemainingMs),
+      MAX_AGENT_IDLE_TIMEOUT_MS,
+    ),
   );
 
   const timer = setTimeout(() => {
@@ -1895,6 +3259,18 @@ function emitRuntimeEvent(event: PixelRuntimeEvent) {
     progress: normalizeProgress(event.progress),
   };
 
+  if (normalized.agentId) {
+    if (shouldExtendAgentIdleWindow(normalized)) {
+      holdAgentBusy(normalized.agentId, ANALYSIS_IDLE_HOLD_MS);
+    } else if (
+      normalized.status === "completed" ||
+      normalized.status === "error" ||
+      normalized.status === "idle"
+    ) {
+      clearAgentBusyHold(normalized.agentId);
+    }
+  }
+
   applyEventToRuntimeState(normalized);
   queueOrSendMessage({ type: "pixel.event", payload: normalized });
 }
@@ -1904,7 +3280,7 @@ function applyEventToRuntimeState(event: PixelRuntimeEvent) {
     runtimeState.git = event.git;
   }
 
-  if (event.agentId) {
+  if (event.agentId && !isBossOnlyEventType(event.type)) {
     const agent = runtimeState.agents[event.agentId];
     agent.lastEventAt = event.timestamp;
 

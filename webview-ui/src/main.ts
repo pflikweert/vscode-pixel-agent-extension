@@ -1,4 +1,5 @@
 import characterSheetUrl from "./assets/agent-characters.jpg";
+import roomBackgroundUrl from "./assets/agent-room-bg.jpg";
 import "./styles.css";
 
 const vscode = acquireVsCodeApi();
@@ -14,6 +15,7 @@ type AgentPhase =
   | "error";
 type AgentZone = "lounge" | "work";
 type AgentRoutine = "normal" | "pause" | "dance" | "sleep";
+type AgentIdleRoutine = AgentRoutine | "phone" | "wave" | "water-plant";
 
 interface AgentViewState {
   id: AgentId;
@@ -36,7 +38,7 @@ interface PixelRuntimeEvent {
   agentId?: AgentId;
   status?: AgentStatus;
   progress?: number;
-  source?: "local" | "copilot-export";
+  source?: "local" | "copilot-export" | "codex";
   traceId?: string;
   spanId?: string;
   model?: string;
@@ -79,6 +81,7 @@ interface AgentVisualState extends AgentViewState {
   targetX: number;
   targetY: number;
   locationLabel: string;
+  idleSpotId?: string;
   workstationId?: string;
   vx: number;
   frame: number;
@@ -118,6 +121,13 @@ interface Spot {
   y: number;
 }
 
+interface IdleSpot extends Spot {
+  id: string;
+  label: string;
+  jitterX: number;
+  jitterY: number;
+}
+
 type WorkstationRole = "research" | "engineering" | "qa";
 
 interface WorkstationSpot extends Spot {
@@ -126,6 +136,15 @@ interface WorkstationSpot extends Spot {
   role: WorkstationRole;
   deskX: number;
   deskY: number;
+  facing: "north" | "east" | "west";
+  screenX: number;
+  screenY: number;
+  screenWidth: number;
+  screenHeight: number;
+  bgScreenX?: number;
+  bgScreenY?: number;
+  bgScreenWidth?: number;
+  bgScreenHeight?: number;
 }
 
 interface WorkstationActivity {
@@ -134,6 +153,8 @@ interface WorkstationActivity {
   completed: number;
   error: number;
 }
+
+type WorkstationScreenMode = "off" | "working" | "completed" | "error";
 
 interface BubbleBox {
   x: number;
@@ -152,6 +173,14 @@ interface BubbleLayout {
   anchorX: number;
 }
 
+interface BossMonitorState {
+  speechText: string;
+  speechVisibleUntil: number;
+  lastEventAt: number;
+  mode: "idle" | "receiving" | "dispatching";
+  targetAgentId?: AgentId;
+}
+
 type ExtensionMessage =
   | { type: "pixel.snapshot"; payload: RuntimeState }
   | { type: "pixel.event"; payload: PixelRuntimeEvent };
@@ -161,25 +190,34 @@ if (!app) {
   throw new Error("Missing #app container.");
 }
 
-const AGENT_INACTIVITY_LIMIT_MS = 10_000;
-const SPEECH_BASE_VISIBLE_MS = 3_600;
-const SPEECH_PER_CHAR_MS = 24;
-const SPEECH_MAX_VISIBLE_MS = 6_200;
+const DEFAULT_AGENT_INACTIVITY_LIMIT_MS = 12_000;
+const ANALYZING_AGENT_INACTIVITY_LIMIT_MS = 35_000;
+const SPEECH_BASE_VISIBLE_MS = 4_600;
+const SPEECH_PER_CHAR_MS = 34;
+const SPEECH_MAX_VISIBLE_MS = 9_200;
+const MESSAGE_SPEECH_BASE_VISIBLE_MS = 5_800;
+const MESSAGE_SPEECH_PER_CHAR_MS = 42;
+const MESSAGE_SPEECH_MAX_VISIBLE_MS = 11_500;
 const BUBBLE_MAX_LINES = 2;
 const BUBBLE_LINE_MAX_CHARS = 34;
 const BUBBLE_MIN_GAP_PX = 3;
 const BUBBLE_EDGE_MARGIN_PX = 4;
 const MAX_VISIBLE_EVENTS = 14;
-const IDLE_CHAT_MIN_GAP_MS = 1_500;
-const IDLE_CHAT_MAX_GAP_MS = 4_800;
-const IDLE_REPLY_MIN_DELAY_MS = 450;
-const IDLE_REPLY_MAX_DELAY_MS = 1_050;
+const IDLE_CHAT_MIN_GAP_MS = 9_000;
+const IDLE_CHAT_MAX_GAP_MS = 24_000;
+const IDLE_REPLY_MIN_DELAY_MS = 900;
+const IDLE_REPLY_MAX_DELAY_MS = 1_850;
+const IDLE_CHAT_RECENT_SPEECH_BLOCK_MS = 11_000;
+const IDLE_CHAT_SKIP_CHANCE = 0.72;
 const COMPLETION_TO_WAITING_MS = 6_500;
 const MIN_SPRITE_COMPONENT_PIXELS = 1_800;
 const MIN_SPRITE_WIDTH = 46;
 const MIN_SPRITE_HEIGHT = 72;
 const DEFAULT_SPRITE_COLUMNS = 3;
 const DEFAULT_SPRITE_ROWS = 4;
+const GRID_TRIM_DISTANCE = 24;
+const GRID_TRIM_MIN_PIXELS = 340;
+const GRID_TRIM_PADDING = 4;
 
 interface IdleJoke {
   setup: string;
@@ -339,6 +377,12 @@ const AGENT_MANGA_PALETTES: Record<AgentId, AgentMangaPalette> = {
   },
 };
 
+const AGENT_MANGA_TITLES: Record<AgentId, string> = {
+  scout: "Akari // Recon Runner",
+  builder: "Rin // Forge Coder",
+  reviewer: "Sora // Edge Auditor",
+};
+
 app.innerHTML = `
   <main class="screen">
     <section class="card">
@@ -355,11 +399,11 @@ app.innerHTML = `
       </header>
 
       <section class="scene-shell">
-        <canvas id="scene" width="320" height="180" aria-label="Pixel agent scene"></canvas>
+        <canvas id="scene" width="320" height="320" aria-label="Pixel agent scene"></canvas>
         <div class="scene-caption">
-          <span class="pill lounge">Middenplein: idle kletsen</span>
-          <span class="pill work">Research = analyse, Engineering = build, QA = review/error</span>
-          <span class="pill">Rustbed: max 1 agent tegelijk</span>
+          <span class="pill lounge">Idle-zone: middenpad + lounge links</span>
+          <span class="pill work">Werkstations volgen de kamerlayout: Research, Engineering en QA</span>
+          <span class="pill">Rustzone bank: max 1 slapende agent</span>
         </div>
       </section>
 
@@ -419,63 +463,200 @@ if (!ctx) {
   throw new Error("Canvas context unavailable.");
 }
 
+const ROOM_LAYOUT_X_OFFSET = -2;
+const ROOM_LAYOUT_Y_OFFSET = 58;
+const ROOM_SCREEN_X_OFFSET = -1;
+const ROOM_SCREEN_Y_OFFSET = -2;
+const ROOM_BACKGROUND_ALPHA = 1;
+const ROOM_BACKGROUND_OVERLAY_BASE_ALPHA = 0;
+const ROOM_BITMAP_SOURCE_WIDTH = 736;
+const ROOM_BITMAP_SOURCE_HEIGHT = 736;
+
+function roomX(value: number): number {
+  return Math.round(value + ROOM_LAYOUT_X_OFFSET);
+}
+
+function roomY(value: number): number {
+  return Math.round(value + ROOM_LAYOUT_Y_OFFSET);
+}
+
+function roomScreenX(value: number): number {
+  return roomX(value + ROOM_SCREEN_X_OFFSET);
+}
+
+function roomScreenY(value: number): number {
+  return roomY(value + ROOM_SCREEN_Y_OFFSET);
+}
+
+function bitmapRoomX(value: number): number {
+  return Math.round((value / ROOM_BITMAP_SOURCE_WIDTH) * canvas.width);
+}
+
+function bitmapRoomY(value: number): number {
+  return Math.round((value / ROOM_BITMAP_SOURCE_HEIGHT) * canvas.height);
+}
+
+function bitmapRoomWidth(value: number): number {
+  return Math.max(1, Math.round((value / ROOM_BITMAP_SOURCE_WIDTH) * canvas.width));
+}
+
+function bitmapRoomHeight(value: number): number {
+  return Math.max(1, Math.round((value / ROOM_BITMAP_SOURCE_HEIGHT) * canvas.height));
+}
+
 const FLOOR_BOUNDS = {
-  left: 20,
-  right: canvas.width - 20,
-  top: 42,
-  bottom: canvas.height - 20,
+  left: roomX(34),
+  right: roomX(canvas.width - 34),
+  top: roomY(44),
+  bottom: roomY(160),
 };
 const CHAT_SPOTS: readonly Spot[] = [
-  { x: 150, y: 106 },
-  { x: 168, y: 118 },
-  { x: 148, y: 132 },
+  { x: roomX(160), y: roomY(102) },
+  { x: roomX(120), y: roomY(138) },
+  { x: roomX(160), y: roomY(150) },
 ];
-const BED_SPOT: Spot = { x: 90, y: 146 };
+const IDLE_SPOTS: readonly IdleSpot[] = [
+  {
+    id: "center-walkway",
+    label: "middenpad",
+    x: roomX(160),
+    y: roomY(102),
+    jitterX: 10,
+    jitterY: 8,
+  },
+  {
+    id: "left-lounge-edge",
+    label: "lounge links",
+    x: roomX(120),
+    y: roomY(138),
+    jitterX: 9,
+    jitterY: 7,
+  },
+  {
+    id: "bottom-center",
+    label: "midden onder",
+    x: roomX(160),
+    y: roomY(150),
+    jitterX: 12,
+    jitterY: 5,
+  },
+  {
+    id: "left-aisle",
+    label: "linker vloer",
+    x: roomX(118),
+    y: roomY(98),
+    jitterX: 8,
+    jitterY: 10,
+  },
+  {
+    id: "right-floor",
+    label: "rechter vloer",
+    x: roomX(194),
+    y: roomY(129),
+    jitterX: 8,
+    jitterY: 7,
+  },
+];
+const PLANT_CARE_SPOT: IdleSpot = {
+  id: "plant-care",
+  label: "planthoek",
+  x: roomX(236),
+  y: roomY(145),
+  jitterX: 3,
+  jitterY: 3,
+};
+const PLANT_WATER_TARGET: Spot = { x: roomX(252), y: roomY(139) };
+const BED_SPOT: Spot = { x: roomX(84), y: roomY(143) };
 const WORKSTATIONS: readonly WorkstationSpot[] = [
   {
     id: "ws-1",
     label: "Research 1",
     role: "research",
-    x: 84,
-    y: 66,
-    deskX: 56,
-    deskY: 36,
+    x: roomX(95),
+    y: roomY(65),
+    deskX: roomX(74),
+    deskY: roomY(42),
+    facing: "north",
+    screenX: roomScreenX(88),
+    screenY: roomScreenY(18),
+    screenWidth: 20,
+    screenHeight: 10,
+    bgScreenX: bitmapRoomX(166),
+    bgScreenY: bitmapRoomY(94),
+    bgScreenWidth: bitmapRoomWidth(46),
+    bgScreenHeight: bitmapRoomHeight(30),
   },
   {
     id: "ws-2",
     label: "Research 2",
     role: "research",
-    x: 236,
-    y: 66,
-    deskX: 206,
-    deskY: 36,
+    x: roomX(227),
+    y: roomY(65),
+    deskX: roomX(208),
+    deskY: roomY(42),
+    facing: "north",
+    screenX: roomScreenX(206),
+    screenY: roomScreenY(18),
+    screenWidth: 28,
+    screenHeight: 10,
+    bgScreenX: bitmapRoomX(462),
+    bgScreenY: bitmapRoomY(94),
+    bgScreenWidth: bitmapRoomWidth(66),
+    bgScreenHeight: bitmapRoomHeight(30),
   },
   {
     id: "ws-3",
     label: "Engineering 1",
     role: "engineering",
-    x: 268,
-    y: 108,
-    deskX: 240,
-    deskY: 84,
+    x: roomX(268),
+    y: roomY(99),
+    deskX: roomX(250),
+    deskY: roomY(72),
+    facing: "west",
+    screenX: roomScreenX(269),
+    screenY: roomScreenY(70),
+    screenWidth: 10,
+    screenHeight: 27,
+    bgScreenX: bitmapRoomX(593),
+    bgScreenY: bitmapRoomY(271),
+    bgScreenWidth: bitmapRoomWidth(22),
+    bgScreenHeight: bitmapRoomHeight(77),
   },
   {
     id: "ws-4",
     label: "Engineering 2",
     role: "engineering",
-    x: 220,
-    y: 146,
-    deskX: 190,
-    deskY: 124,
+    x: roomX(221),
+    y: roomY(152),
+    deskX: roomX(194),
+    deskY: roomY(126),
+    facing: "north",
+    screenX: roomScreenX(206),
+    screenY: roomScreenY(131),
+    screenWidth: 20,
+    screenHeight: 10,
+    bgScreenX: bitmapRoomX(489),
+    bgScreenY: bitmapRoomY(466),
+    bgScreenWidth: bitmapRoomWidth(50),
+    bgScreenHeight: bitmapRoomHeight(22),
   },
   {
     id: "ws-5",
     label: "QA 1",
     role: "qa",
-    x: 56,
-    y: 108,
-    deskX: 28,
-    deskY: 84,
+    x: roomX(74),
+    y: roomY(102),
+    deskX: roomX(22),
+    deskY: roomY(76),
+    facing: "east",
+    screenX: roomScreenX(40),
+    screenY: roomScreenY(70),
+    screenWidth: 10,
+    screenHeight: 27,
+    bgScreenX: bitmapRoomX(139),
+    bgScreenY: bitmapRoomY(231),
+    bgScreenWidth: bitmapRoomWidth(20),
+    bgScreenHeight: bitmapRoomHeight(77),
   },
 ];
 const ROLE_TO_STATIONS: Record<WorkstationRole, readonly string[]> = {
@@ -500,8 +681,8 @@ const agentState: Record<AgentId, AgentVisualState> = {
     "#ff94c8",
     CHAT_SPOTS[0].x,
     0,
-    0.46,
-    0.3,
+    0.46 + Math.random() * 0.2,
+    0.3 + Math.random() * 0.7,
   ),
   builder: createDefaultAgent(
     "builder",
@@ -509,8 +690,8 @@ const agentState: Record<AgentId, AgentVisualState> = {
     "#ff7dbb",
     CHAT_SPOTS[1].x,
     1,
-    -0.41,
-    1.4,
+    -0.41 + Math.random() * 0.2,
+    1.4 + Math.random() * 0.7,
   ),
   reviewer: createDefaultAgent(
     "reviewer",
@@ -518,18 +699,143 @@ const agentState: Record<AgentId, AgentVisualState> = {
     "#ff9fd2",
     CHAT_SPOTS[2].x,
     2,
-    0.52,
-    2.5,
+    0.52 + Math.random() * 0.2,
+    2.5 + Math.random() * 0.7,
   ),
 };
+
+// Idle event/overlay icon system
+const IDLE_OVERLAY_ICONS = [
+  "💡", "❓", "💤", "❤️", "🤔", "📱", "🎵", "🎮", "😴", "😂", "😎", "👀", "🍕", "☕", "🎉"
+];
+const IDLE_ACTIONS = [
+  { routine: "dance", icon: "🎵", label: "Dansje" },
+  { routine: "pause", icon: "🤔", label: "Denken" },
+  { routine: "normal", icon: "👀", label: "Kijken" },
+  { routine: "phone", icon: "📱", label: "Telefoon" },
+  { routine: "wave", icon: "👋", label: "Zwaaien" },
+  { routine: "water-plant", icon: "💧", label: "Plant water geven" },
+  { routine: "sleep", icon: "💤", label: "Slapen" },
+];
+interface AgentIdleOverlay {
+  icon: string;
+  until: number;
+  action?: AgentIdleRoutine;
+}
+const agentIdleOverlays: Record<AgentId, AgentIdleOverlay | null> = {
+  scout: null,
+  builder: null,
+  reviewer: null,
+};
+
+function maybeTriggerIdleOverlay(now: number) {
+  for (const id of agentOrder) {
+    const agent = agentState[id];
+    // Alleen als idle, niet slapend, geen overlay actief, en random kans
+    if (
+      agent.status === "idle" &&
+      agent.routine !== "sleep" &&
+      !agentIdleOverlays[id] &&
+      Math.random() < 0.045 // iets vaker events
+    ) {
+      // 1 op 2 kans op een "speciale" actie (dansje, zwaaien, telefoon, slapen)
+      if (Math.random() < 0.5) {
+        // Trigger een idle-actie
+        const action = pickRandom(IDLE_ACTIONS);
+        if (action.routine === "sleep" && isBedOccupied(agent.id)) {
+          // Sla over als bed bezet
+          continue;
+        }
+        if (
+          action.routine === "water-plant" &&
+          isPlantCareOccupied(agent.id)
+        ) {
+          continue;
+        }
+        // Speciaal: als actie "wave" of "phone", toon icoon en routine
+        if (
+          action.routine === "wave" ||
+          action.routine === "phone" ||
+          action.routine === "water-plant"
+        ) {
+          const actionDuration =
+            action.routine === "water-plant"
+              ? randomRange(2200, 4200)
+              : randomRange(1200, 2600);
+          agentIdleOverlays[id] = {
+            icon: action.icon,
+            until: now + actionDuration,
+            action: action.routine,
+          };
+          agent.routine = "pause";
+          agent.routineUntilMs = now + actionDuration;
+          agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2400);
+          applyZoneFromStatus(agent);
+        } else {
+          // Normale routine (dans, slapen, etc.)
+          agent.routine = action.routine as AgentRoutine;
+          agent.routineUntilMs = now + randomRange(1800, 4200);
+          agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2400);
+          agentIdleOverlays[id] = {
+            icon: action.icon,
+            until: now + randomRange(1200, 3200),
+            action: action.routine,
+          };
+          applyZoneFromStatus(agent);
+        }
+      } else {
+        // Toon een overlay-icoon
+        const icon = pickRandom(IDLE_OVERLAY_ICONS);
+        agentIdleOverlays[id] = {
+          icon,
+          until: now + randomRange(1200, 3200),
+        };
+      }
+    }
+    // Verwijder overlay als verlopen
+    if (agentIdleOverlays[id] && now > agentIdleOverlays[id]!.until) {
+      const expiredAction = agentIdleOverlays[id]!.action;
+      agentIdleOverlays[id] = null;
+      if (
+        expiredAction === "water-plant" &&
+        agent.status === "idle" &&
+        agent.idleSpotId === PLANT_CARE_SPOT.id
+      ) {
+        agent.routine = "normal";
+        agent.routineUntilMs = now + randomRange(1500, 2600);
+        agent.nextRoutineAtMs = agent.routineUntilMs + randomRange(900, 2200);
+        applyZoneFromStatus(agent);
+      }
+    }
+  }
+}
 
 const runtimeEvents: PixelRuntimeEvent[] = [];
 let currentGitState = createDefaultGitState();
 let nextIdleChatAt =
   Date.now() +
   Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
+const bossMonitorState: BossMonitorState = {
+  speechText: "",
+  speechVisibleUntil: 0,
+  lastEventAt: 0,
+  mode: "idle",
+};
 let spriteSheetImage: HTMLImageElement | undefined;
+let roomBackgroundImage: HTMLImageElement | undefined;
 let spriteVariants: AgentSpriteVariant[] = [];
+
+function renderConnectionStatus(prefix = "Connected") {
+  if (!status) {
+    return;
+  }
+  const spritePart =
+    spriteVariants.length > 0
+      ? `chars ${spriteVariants.length}`
+      : "default sprites";
+  const roomPart = roomBackgroundImage ? "bg room ok" : "bg fallback";
+  status.textContent = `${prefix} | ${spritePart} | ${roomPart}`;
+}
 
 function createDefaultGitState(): GitViewState {
   return {
@@ -573,6 +879,7 @@ function createDefaultAgent(
     targetX: startSpot.x,
     targetY: startSpot.y,
     locationLabel: "middenplein",
+    idleSpotId: undefined,
     workstationId: undefined,
     vx,
     frame: 0,
@@ -589,7 +896,7 @@ function createDefaultAgent(
     routineUntilMs: nowMs + randomRange(1800, 3600),
     nextRoutineAtMs: nowMs + randomRange(1100, 2600),
     characterId: `${id}-default`,
-    characterLabel: "Character ?",
+    characterLabel: AGENT_MANGA_TITLES[id],
     spriteRect: undefined,
   };
 }
@@ -627,6 +934,64 @@ function isBedOccupied(exceptAgentId?: AgentId): boolean {
         agent.routine === "sleep" &&
         agent.locationLabel === "rustbed",
     );
+}
+
+function isPlantCareOccupied(exceptAgentId?: AgentId): boolean {
+  return agentOrder
+    .map((id) => agentState[id])
+    .some(
+      (agent) =>
+        agent.id !== exceptAgentId &&
+        agent.status === "idle" &&
+        agent.idleSpotId === PLANT_CARE_SPOT.id,
+    );
+}
+
+function randomizeIdleSpot(spot: IdleSpot): Spot {
+  const offsetX = Math.round(randomRange(-spot.jitterX, spot.jitterX));
+  const offsetY = Math.round(randomRange(-spot.jitterY, spot.jitterY));
+  return {
+    x: clamp(spot.x + offsetX, FLOOR_BOUNDS.left, FLOOR_BOUNDS.right),
+    y: clamp(spot.y + offsetY, FLOOR_BOUNDS.top, FLOOR_BOUNDS.bottom),
+  };
+}
+
+function countIdleSpotOccupancy(spotId: string, exceptAgentId?: AgentId): number {
+  return agentOrder
+    .map((id) => agentState[id])
+    .filter(
+      (other) =>
+        other.id !== exceptAgentId &&
+        other.status === "idle" &&
+        other.idleSpotId === spotId,
+    ).length;
+}
+
+function assignIdleTarget(agent: AgentVisualState, spot: IdleSpot) {
+  const target = randomizeIdleSpot(spot);
+  agent.targetX = target.x;
+  agent.targetY = target.y;
+  agent.locationLabel = spot.label;
+  agent.idleSpotId = spot.id;
+  agent.lane = spot.id === PLANT_CARE_SPOT.id
+    ? IDLE_SPOTS.length
+    : Math.max(0, IDLE_SPOTS.findIndex((candidate) => candidate.id === spot.id));
+}
+
+function resolveIdleSpot(agent: AgentVisualState): IdleSpot {
+  const anchorIndex = Math.max(0, agentOrder.indexOf(agent.id));
+  const candidates = IDLE_SPOTS.map((spot, index) => {
+    const occupancyPenalty = countIdleSpotOccupancy(spot.id, agent.id) * 1000;
+    const distancePenalty = Math.hypot(agent.x - spot.x, agent.y - spot.y);
+    const anchorPenalty = Math.abs(index - anchorIndex) * 12;
+    const sameSpotBonus = agent.idleSpotId === spot.id ? -18 : 0;
+    return {
+      spot,
+      score: occupancyPenalty + distancePenalty + anchorPenalty + sameSpotBonus,
+    };
+  }).sort((left, right) => left.score - right.score);
+
+  return candidates[0]?.spot || IDLE_SPOTS[0];
 }
 
 function getWorkstationById(id: string): WorkstationSpot | undefined {
@@ -707,9 +1072,12 @@ function resolveWorkstation(agent: AgentVisualState): WorkstationSpot {
   return bestStation;
 }
 
-function resolveChatSpot(agent: AgentVisualState): Spot {
-  const index = Math.max(0, agentOrder.indexOf(agent.id)) % CHAT_SPOTS.length;
-  return CHAT_SPOTS[index];
+function isNearWorkstation(x: number, y: number, margin = 18): boolean {
+  return WORKSTATIONS.some(ws => {
+    const dx = Math.abs(ws.x - x);
+    const dy = Math.abs(ws.y - y);
+    return dx < margin && dy < margin;
+  });
 }
 
 function applyZoneFromStatus(agent: AgentVisualState) {
@@ -721,6 +1089,7 @@ function applyZoneFromStatus(agent: AgentVisualState) {
     agent.targetX = station.x;
     agent.targetY = station.y;
     agent.locationLabel = station.label;
+    agent.idleSpotId = undefined;
     agent.workstationId = station.id;
     agent.lane = WORKSTATIONS.findIndex((value) => value.id === station.id);
   } else {
@@ -729,17 +1098,41 @@ function applyZoneFromStatus(agent: AgentVisualState) {
       agent.targetX = BED_SPOT.x;
       agent.targetY = BED_SPOT.y;
       agent.locationLabel = "rustbed";
+      agent.idleSpotId = "bed";
       agent.lane = 0;
     } else {
       if (agent.routine === "sleep" && isBedOccupied(agent.id)) {
         agent.routine = "pause";
       }
 
-      const chatSpot = resolveChatSpot(agent);
-      agent.targetX = chatSpot.x;
-      agent.targetY = chatSpot.y;
-      agent.locationLabel = "middenplein";
-      agent.lane = Math.max(0, agentOrder.indexOf(agent.id));
+      const overlay = agentIdleOverlays[agent.id];
+      const wantsPlantCare =
+        overlay?.action === "water-plant" && !isPlantCareOccupied(agent.id);
+      if (overlay?.action === "water-plant" && !wantsPlantCare) {
+        agentIdleOverlays[agent.id] = null;
+      }
+
+      if (wantsPlantCare) {
+        assignIdleTarget(agent, PLANT_CARE_SPOT);
+      } else {
+        let spot = resolveIdleSpot(agent);
+        let target = randomizeIdleSpot(spot);
+        let tries = 0;
+        while (isNearWorkstation(target.x, target.y) && tries < 6) {
+          spot = resolveIdleSpot(agent);
+          target = randomizeIdleSpot(spot);
+          tries += 1;
+        }
+
+        agent.targetX = target.x;
+        agent.targetY = target.y;
+        agent.locationLabel = spot.label;
+        agent.idleSpotId = spot.id;
+        agent.lane = Math.max(
+          0,
+          IDLE_SPOTS.findIndex((candidate) => candidate.id === spot.id),
+        );
+      }
     }
   }
 
@@ -965,6 +1358,18 @@ function buildGridFallbackRects(image: HTMLImageElement): SpriteRect[] {
   const height = image.naturalHeight || image.height;
   const cellWidth = Math.floor(width / DEFAULT_SPRITE_COLUMNS);
   const cellHeight = Math.floor(height / DEFAULT_SPRITE_ROWS);
+
+  const offscreen = document.createElement("canvas");
+  offscreen.width = width;
+  offscreen.height = height;
+  const offCtx = offscreen.getContext("2d", { willReadFrequently: true });
+  if (!offCtx) {
+    return [];
+  }
+
+  offCtx.drawImage(image, 0, 0, width, height);
+  const data = offCtx.getImageData(0, 0, width, height).data;
+
   const rects: SpriteRect[] = [];
 
   for (let row = 0; row < DEFAULT_SPRITE_ROWS; row += 1) {
@@ -973,6 +1378,89 @@ function buildGridFallbackRects(image: HTMLImageElement): SpriteRect[] {
       const y = row * cellHeight;
       const w = col === DEFAULT_SPRITE_COLUMNS - 1 ? width - x : cellWidth;
       const h = row === DEFAULT_SPRITE_ROWS - 1 ? height - y : cellHeight;
+
+      const sampleInset = Math.max(1, Math.floor(Math.min(w, h) * 0.08));
+      const c1 = (Math.max(0, y + sampleInset) * width +
+        Math.max(0, x + sampleInset)) *
+        4;
+      const c2 = (Math.max(0, y + sampleInset) * width +
+        Math.min(width - 1, x + w - 1 - sampleInset)) *
+        4;
+      const c3 = (Math.min(height - 1, y + h - 1 - sampleInset) * width +
+        Math.max(0, x + sampleInset)) *
+        4;
+      const c4 = (Math.min(height - 1, y + h - 1 - sampleInset) * width +
+        Math.min(width - 1, x + w - 1 - sampleInset)) *
+        4;
+
+      const bgR =
+        (data[c1] + data[c2] + data[c3] + data[c4]) /
+        4;
+      const bgG =
+        (data[c1 + 1] + data[c2 + 1] + data[c3 + 1] + data[c4 + 1]) /
+        4;
+      const bgB =
+        (data[c1 + 2] + data[c2 + 2] + data[c3 + 2] + data[c4 + 2]) /
+        4;
+
+      let minX = x + w;
+      let minY = y + h;
+      let maxX = -1;
+      let maxY = -1;
+      let foregroundPixels = 0;
+
+      for (let py = y; py < y + h; py += 1) {
+        for (let px = x; px < x + w; px += 1) {
+          const idx = (py * width + px) * 4;
+          const alpha = data[idx + 3];
+          if (alpha < 20) {
+            continue;
+          }
+
+          const distance =
+            Math.abs(data[idx] - bgR) +
+            Math.abs(data[idx + 1] - bgG) +
+            Math.abs(data[idx + 2] - bgB);
+          if (distance < GRID_TRIM_DISTANCE) {
+            continue;
+          }
+
+          foregroundPixels += 1;
+          if (px < minX) {
+            minX = px;
+          }
+          if (py < minY) {
+            minY = py;
+          }
+          if (px > maxX) {
+            maxX = px;
+          }
+          if (py > maxY) {
+            maxY = py;
+          }
+        }
+      }
+
+      if (
+        foregroundPixels >= GRID_TRIM_MIN_PIXELS &&
+        maxX >= minX &&
+        maxY >= minY
+      ) {
+        const trimmedX = Math.max(x, minX - GRID_TRIM_PADDING);
+        const trimmedY = Math.max(y, minY - GRID_TRIM_PADDING);
+        const trimmedW = Math.min(x + w - 1, maxX + GRID_TRIM_PADDING) - trimmedX + 1;
+        const trimmedH = Math.min(y + h - 1, maxY + GRID_TRIM_PADDING) - trimmedY + 1;
+
+        rects.push({
+          x: trimmedX,
+          y: trimmedY,
+          width: Math.max(1, trimmedW),
+          height: Math.max(1, trimmedH),
+          pixelCount: foregroundPixels,
+        });
+        continue;
+      }
+
       rects.push({
         x,
         y,
@@ -997,12 +1485,55 @@ function toSpriteVariants(rects: SpriteRect[]): AgentSpriteVariant[] {
   });
 }
 
+function pickStableColumnVariants(
+  variants: AgentSpriteVariant[],
+): AgentSpriteVariant[] {
+  if (!spriteSheetImage) {
+    return [];
+  }
+
+  const imageWidth = spriteSheetImage.naturalWidth || spriteSheetImage.width;
+  const cellWidth = imageWidth / DEFAULT_SPRITE_COLUMNS;
+  const byColumn: AgentSpriteVariant[][] = Array.from(
+    { length: DEFAULT_SPRITE_COLUMNS },
+    () => [],
+  );
+
+  for (const variant of variants) {
+    const centerX = variant.rect.x + variant.rect.width / 2;
+    const col = clamp(
+      Math.floor(centerX / cellWidth),
+      0,
+      DEFAULT_SPRITE_COLUMNS - 1,
+    );
+    byColumn[col].push(variant);
+  }
+
+  const picks: AgentSpriteVariant[] = [];
+  for (const columnVariants of byColumn) {
+    if (columnVariants.length === 0) {
+      continue;
+    }
+    columnVariants.sort(
+      (left, right) => right.rect.pixelCount - left.rect.pixelCount,
+    );
+    picks.push(columnVariants[0]);
+  }
+
+  return picks;
+}
+
 function assignRandomCharactersToAgents() {
   if (spriteVariants.length < agentOrder.length) {
     return;
   }
 
-  const picks = pickUniqueRandom(spriteVariants, agentOrder.length);
+  const preferred = pickStableColumnVariants(spriteVariants);
+  const picks =
+    preferred.length >= agentOrder.length
+      ? preferred.slice(0, agentOrder.length)
+      : pickUniqueRandom(spriteVariants, agentOrder.length);
+
   for (let i = 0; i < agentOrder.length; i += 1) {
     const agentId = agentOrder[i];
     const variant = picks[i];
@@ -1028,29 +1559,122 @@ async function initializeCharacterSprites() {
     spriteVariants = toSpriteVariants(usableRects);
     assignRandomCharactersToAgents();
     renderAgents();
-
-    if (status) {
-      status.textContent = `Connected | chars ${spriteVariants.length}`;
-    }
+    renderConnectionStatus();
   } catch {
     spriteSheetImage = undefined;
     spriteVariants = [];
-    if (status) {
-      status.textContent = "Connected | default sprites";
-    }
+    renderConnectionStatus();
   }
+}
+
+async function initializeRoomBackground() {
+  try {
+    roomBackgroundImage = await loadImage(roomBackgroundUrl);
+  } catch {
+    roomBackgroundImage = undefined;
+  }
+  renderConnectionStatus();
+}
+
+function setBossSpeechText(
+  text: string,
+  timestamp: number = Date.now(),
+  mode: BossMonitorState["mode"] = "receiving",
+  targetAgentId?: AgentId,
+) {
+  const normalized = shorten(text.replace(/\s+/g, " ").trim(), 92);
+  if (!normalized) {
+    bossMonitorState.speechText = "";
+    bossMonitorState.speechVisibleUntil = 0;
+    bossMonitorState.lastEventAt = 0;
+    bossMonitorState.mode = "idle";
+    bossMonitorState.targetAgentId = undefined;
+    return;
+  }
+
+  const visibleDuration = clamp(
+    5200 + normalized.length * 44,
+    5200,
+    12000,
+  );
+  bossMonitorState.speechText = normalized;
+  bossMonitorState.lastEventAt = timestamp;
+  bossMonitorState.speechVisibleUntil = timestamp + visibleDuration;
+  bossMonitorState.mode = mode;
+  bossMonitorState.targetAgentId = targetAgentId;
+}
+
+function isBossSpeechVisible(nowMs: number): boolean {
+  const visible =
+    Boolean(bossMonitorState.speechText) &&
+    nowMs <= bossMonitorState.speechVisibleUntil;
+  if (!visible) {
+    bossMonitorState.mode = "idle";
+    bossMonitorState.targetAgentId = undefined;
+  }
+  return visible;
+}
+
+function isBossOnlyEventType(type: string): boolean {
+  return /^ops\./.test(type);
+}
+
+function bossSpeechPayloadFromEvent(
+  event: PixelRuntimeEvent,
+):
+  | { text: string; mode: BossMonitorState["mode"]; targetAgentId?: AgentId }
+  | undefined {
+  const text = event.detail || event.summary;
+  if (!text) {
+    return undefined;
+  }
+
+  if (event.type === "chat.userPrompt" || event.type === "codex.userMessage") {
+    return { text, mode: "receiving" };
+  }
+
+  if (event.type === "ops.dispatch") {
+    return { text, mode: "dispatching", targetAgentId: event.agentId };
+  }
+
+  return undefined;
+}
+
+function syncBossFromEvents(events: readonly PixelRuntimeEvent[]) {
+  const latestBossEvent = events.find((event) => Boolean(bossSpeechPayloadFromEvent(event)));
+  if (!latestBossEvent) {
+    return;
+  }
+
+  const payload = bossSpeechPayloadFromEvent(latestBossEvent);
+  if (!payload) {
+    return;
+  }
+
+  setBossSpeechText(
+    payload.text,
+    latestBossEvent.timestamp || Date.now(),
+    payload.mode,
+    payload.targetAgentId,
+  );
 }
 
 function setAgentSpeechText(
   agent: AgentVisualState,
   text: string,
   timestamp: number = Date.now(),
+  timing?: {
+    baseMs?: number;
+    perCharMs?: number;
+    maxMs?: number;
+  },
 ) {
   const normalized = shorten(text.replace(/\s+/g, " ").trim(), 96);
   const visibleDuration = clamp(
-    SPEECH_BASE_VISIBLE_MS + normalized.length * SPEECH_PER_CHAR_MS,
-    SPEECH_BASE_VISIBLE_MS,
-    SPEECH_MAX_VISIBLE_MS,
+    (timing?.baseMs ?? SPEECH_BASE_VISIBLE_MS) +
+      normalized.length * (timing?.perCharMs ?? SPEECH_PER_CHAR_MS),
+    timing?.baseMs ?? SPEECH_BASE_VISIBLE_MS,
+    timing?.maxMs ?? SPEECH_MAX_VISIBLE_MS,
   );
   agent.speechText = normalized;
   agent.lastSpeechAt = timestamp;
@@ -1097,17 +1721,30 @@ function maybeRunIdleChatter() {
     return;
   }
 
-  const idleAgents = agentOrder
+  const hasVisibleBubble = agentOrder
     .map((id) => agentState[id])
-    .filter((agent) => agent.status === "idle" && agent.routine !== "sleep");
-
-  if (idleAgents.length < 2) {
-    nextIdleChatAt = now + Math.round(randomRange(900, 2200));
+    .some((agent) => isSpeechVisible(agent, now));
+  if (hasVisibleBubble) {
+    nextIdleChatAt = now + Math.round(randomRange(4_500, 8_500));
     return;
   }
 
-  if (Math.random() < 0.34) {
-    nextIdleChatAt = now + Math.round(randomRange(1200, 2800));
+  const idleAgents = agentOrder
+    .map((id) => agentState[id])
+    .filter(
+      (agent) =>
+        agent.status === "idle" &&
+        agent.routine !== "sleep" &&
+        now - agent.lastSpeechAt >= IDLE_CHAT_RECENT_SPEECH_BLOCK_MS,
+    );
+
+  if (idleAgents.length < 2) {
+    nextIdleChatAt = now + Math.round(randomRange(5_000, 9_500));
+    return;
+  }
+
+  if (Math.random() < IDLE_CHAT_SKIP_CHANCE) {
+    nextIdleChatAt = now + Math.round(randomRange(6_500, 12_000));
     return;
   }
 
@@ -1218,6 +1855,10 @@ function buildSpeechFromEvent(
   agent: AgentVisualState,
   event: PixelRuntimeEvent,
 ): string {
+  if (event.type === "codex.reasoning") {
+    return "hmm... ik zoek het even uit";
+  }
+
   const baseSummary = event.summary
     ? shorten(event.summary.replace(/\s+/g, " ").trim(), 74)
     : getActiveLine(agent);
@@ -1228,11 +1869,36 @@ function buildSpeechFromEvent(
   return baseSummary || getIdleLine(agent, event.timestamp || Date.now());
 }
 
+function speechTimingForEvent(event: PixelRuntimeEvent): {
+  baseMs: number;
+  perCharMs: number;
+  maxMs: number;
+} {
+  if (
+    /message|response|chat\.completed|chat\.streaming|codex\.response/.test(
+      event.type,
+    )
+  ) {
+    return {
+      baseMs: MESSAGE_SPEECH_BASE_VISIBLE_MS,
+      perCharMs: MESSAGE_SPEECH_PER_CHAR_MS,
+      maxMs: MESSAGE_SPEECH_MAX_VISIBLE_MS,
+    };
+  }
+
+  return {
+    baseMs: SPEECH_BASE_VISIBLE_MS,
+    perCharMs: SPEECH_PER_CHAR_MS,
+    maxMs: SPEECH_MAX_VISIBLE_MS,
+  };
+}
+
 function setAgentSpeech(agent: AgentVisualState, event: PixelRuntimeEvent) {
   setAgentSpeechText(
     agent,
     buildSpeechFromEvent(agent, event),
     event.timestamp || Date.now(),
+    speechTimingForEvent(event),
   );
 }
 
@@ -1354,7 +2020,7 @@ function phaseToLabel(phase: AgentPhase): string {
 
 function resolveWorkingPhaseFromText(text: string): AgentPhase {
   if (
-    /analy|analyse|scan|diagnos|context|plan|read|diff|status|review/.test(text)
+    /analy|analyse|scan|diagnos|context|plan|read|diff|status|review|explor|reasoning|think|uitzoek/.test(text)
   ) {
     return "analyzing";
   }
@@ -1407,13 +2073,16 @@ function derivePhaseFromEvent(
   if (/chat\.completed/.test(type)) {
     return "done";
   }
+  if (/codex\.reasoning/.test(type)) {
+    return "analyzing";
+  }
   if (
     /idletimeout|wacht|waiting|geen nieuwe events|no new events/.test(combined)
   ) {
     return "waiting-input";
   }
   if (
-    /analy|analyse|scan|diagnos|context|plan|read|diff|status|review/.test(
+    /analy|analyse|scan|diagnos|context|plan|read|diff|status|review|explor|reasoning|think|uitzoek/.test(
       combined,
     )
   ) {
@@ -1475,7 +2144,20 @@ function formatRuntimeStatus(
     return "Wacht op input | laatste antwoord klaar";
   }
 
-  return "Wacht op input | lounge chat actief";
+  return "Wacht op input | lounge rustig";
+}
+
+function inactivityLimitForAgent(agent: AgentVisualState): number {
+  const combined = `${agent.phase} ${agent.lastEventType} ${agent.task}`.toLowerCase();
+  if (
+    agent.status === "working" &&
+    /analy|analyse|explor|reasoning|thinking|context|plan|read|scan|search|inspect|diff|status|uitzoek/.test(
+      combined,
+    )
+  ) {
+    return ANALYZING_AGENT_INACTIVITY_LIMIT_MS;
+  }
+  return DEFAULT_AGENT_INACTIVITY_LIMIT_MS;
 }
 
 function renderGitState(git: GitViewState) {
@@ -1550,7 +2232,7 @@ function applySnapshot(snapshot: RuntimeState) {
       lastEventAt: incoming.lastEventAt,
     };
 
-    if (now - incoming.lastEventAt <= SPEECH_MAX_VISIBLE_MS) {
+    if (now - incoming.lastEventAt <= MESSAGE_SPEECH_MAX_VISIBLE_MS) {
       const speech = incoming.task
         ? shorten(incoming.task, 88)
         : getActiveLine(agentState[agentId]);
@@ -1566,10 +2248,17 @@ function applySnapshot(snapshot: RuntimeState) {
 
   runtimeEvents.length = 0;
   runtimeEvents.push(...snapshot.eventLog.slice(0, MAX_VISIBLE_EVENTS));
+  for (const agentId of agentOrder) {
+    const latestEvent = runtimeEvents.find((event) => event.agentId === agentId);
+    if (latestEvent?.type) {
+      agentState[agentId].lastEventType = latestEvent.type;
+    }
+  }
+  syncBossFromEvents(runtimeEvents);
   renderGitState(snapshot.git || createDefaultGitState());
 
   setRuntimeStatus(
-    snapshot.statusLine || "Wacht op input | lounge chat actief",
+    snapshot.statusLine || "Wacht op input | lounge rustig",
   );
   renderAgents();
   renderEvents();
@@ -1581,7 +2270,17 @@ function applyEvent(event: PixelRuntimeEvent) {
     renderGitState(event.git);
   }
 
-  if (event.agentId) {
+  const bossPayload = bossSpeechPayloadFromEvent(event);
+  if (bossPayload) {
+    setBossSpeechText(
+      bossPayload.text,
+      event.timestamp || Date.now(),
+      bossPayload.mode,
+      bossPayload.targetAgentId,
+    );
+  }
+
+  if (event.agentId && !isBossOnlyEventType(event.type)) {
     const agent = agentState[event.agentId];
     if (agent) {
       if (event.status) {
@@ -1644,13 +2343,403 @@ function stationRoleDeskColor(role: WorkstationRole): string {
 }
 
 function stationRoleMonitorColor(role: WorkstationRole, glow: number): string {
+  // Minder fel, meer realistisch blauw/groen/geel
   if (role === "research") {
-    return `rgb(${glow}, ${Math.min(255, glow + 18)}, 255)`;
+    return `rgb(${Math.round(glow * 0.72)}, ${Math.round(glow * 0.85)}, ${Math.round(200 + glow * 0.18)})`;
   }
   if (role === "engineering") {
-    return `rgb(255, ${Math.min(255, glow + 16)}, ${Math.max(170, glow - 22)})`;
+    return `rgb(${Math.round(200 + glow * 0.18)}, ${Math.round(glow * 0.85)}, ${Math.round(glow * 0.45)})`;
   }
-  return `rgb(255, ${Math.max(160, glow - 35)}, ${Math.min(255, glow + 20)})`;
+  // QA: zacht geel/groen
+  return `rgb(${Math.round(220 + glow * 0.12)}, ${Math.round(220 + glow * 0.18)}, ${Math.round(glow * 0.18)})`;
+}
+
+function resolveWorkstationScreenMode(
+  activity?: WorkstationActivity,
+): WorkstationScreenMode {
+  if (!activity || activity.occupied === 0) {
+    return "off";
+  }
+  if (activity.error > 0) {
+    return "error";
+  }
+  if (activity.completed > 0) {
+    return "completed";
+  }
+  return "working";
+}
+
+function getWorkstationScreenRect(station: WorkstationSpot): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} {
+  const backgroundScene = Boolean(roomBackgroundImage);
+
+  if (
+    backgroundScene &&
+    typeof station.bgScreenX === "number" &&
+    typeof station.bgScreenY === "number" &&
+    typeof station.bgScreenWidth === "number" &&
+    typeof station.bgScreenHeight === "number"
+  ) {
+    return {
+      x: station.bgScreenX,
+      y: station.bgScreenY,
+      width: station.bgScreenWidth,
+      height: station.bgScreenHeight,
+    };
+  }
+
+  return {
+    x: station.screenX,
+    y: station.screenY,
+    width: station.screenWidth,
+    height: station.screenHeight,
+  };
+}
+
+function drawWorkstationScreen(
+  station: WorkstationSpot,
+  nowMs: number,
+  pulse: number,
+  activity?: WorkstationActivity,
+) {
+  const mode = resolveWorkstationScreenMode(activity);
+  const { x, y, width, height } = getWorkstationScreenRect(station);
+
+  ctx.fillStyle = "#0f1a2a";
+  ctx.fillRect(x - 1, y - 1, width + 2, height + 2);
+  ctx.fillStyle = "#243348";
+  ctx.fillRect(x, y, width, height);
+
+  if (mode === "off") {
+    const standbyOn = Math.sin(nowMs * 0.003 + x * 0.8 + y) > 0.72;
+    ctx.fillStyle = standbyOn ? "#8fd4e8" : "#4d657d";
+    ctx.fillRect(x + width - 2, y + height - 2, 1, 1);
+    return;
+  }
+
+  const glow = 190 + Math.floor(38 * Math.sin(pulse));
+  const baseColor =
+    mode === "error"
+      ? `rgb(255, ${Math.max(80, glow - 120)}, ${Math.max(125, glow - 75)})`
+      : mode === "completed"
+        ? `rgb(${Math.max(130, glow - 40)}, 255, ${Math.max(170, glow - 20)})`
+        : stationRoleMonitorColor(station.role, glow);
+  ctx.fillStyle = baseColor;
+  ctx.fillRect(x, y, width, height);
+
+  const scanX =
+    ((Math.floor(nowMs / 95) + x + y) %
+      (width + 6)) -
+    3;
+  if (scanX >= 0 && scanX < width) {
+    ctx.fillStyle = "rgba(244, 252, 255, 0.5)";
+    ctx.fillRect(x + scanX, y, 1, height);
+  }
+
+  ctx.fillStyle =
+    mode === "error"
+      ? "rgba(64, 20, 34, 0.56)"
+      : mode === "completed"
+        ? "rgba(18, 54, 42, 0.5)"
+        : "rgba(13, 33, 48, 0.5)";
+  ctx.fillRect(x, y, width, 1);
+
+  const maxBarWidth = Math.max(2, width - 2);
+  const rowCount = Math.max(2, Math.floor((height - 2) / 2));
+  for (let row = 0; row < rowCount; row += 1) {
+    const phase = Math.floor(
+      nowMs / (108 + row * 17) + station.deskX + row * 5 + y,
+    );
+    const barWidth = 1 + (phase % maxBarWidth);
+    ctx.fillStyle =
+      mode === "error"
+        ? "rgba(255, 225, 236, 0.78)"
+        : mode === "completed"
+          ? "rgba(222, 255, 236, 0.76)"
+          : "rgba(226, 245, 255, 0.74)";
+    ctx.fillRect(x + 1, y + 1 + row * 2, barWidth, 1);
+  }
+
+  const blink = Math.sin(nowMs * 0.012 + x * 0.2) > 0.2;
+  if (mode === "working" && blink) {
+    const cursorX = x + 1 + (Math.floor(nowMs / 140) % Math.max(1, width - 2));
+    ctx.fillStyle = "#f8fdff";
+    ctx.fillRect(cursorX, y + height - 2, 1, 1);
+  }
+  if (mode === "completed" && blink) {
+    ctx.fillStyle = "#effff5";
+    ctx.fillRect(x + width - 3, y + 1, 2, 1);
+    ctx.fillRect(x + width - 2, y + 2, 1, 1);
+  }
+  if (mode === "error" && blink) {
+    ctx.fillStyle = "#fff0f6";
+    ctx.fillRect(x + 1, y + 1, 2, 2);
+  }
+}
+
+function getBossMonitorRect(backgroundScene: boolean) {
+  if (backgroundScene) {
+    return {
+      x: bitmapRoomX(42),
+      y: bitmapRoomY(64),
+      width: bitmapRoomWidth(90),
+      height: bitmapRoomHeight(58),
+    };
+  }
+
+  return { x: 18, y: 18, width: 58, height: 38 };
+}
+
+function drawBossHeadSprite(
+  x: number,
+  y: number,
+  nowMs: number,
+  mode: BossMonitorState["mode"],
+) {
+  const blink = Math.sin(nowMs * 0.008) > 0.82;
+  const receiving = mode === "receiving";
+  const dispatching = mode === "dispatching";
+  const mouthPulse = dispatching ? Math.sin(nowMs * 0.03) > 0 : receiving;
+
+  drawPixelRect(x + 4, y + 2, 16, 12, "#1e2b40");
+  drawPixelRect(x + 5, y + 3, 14, 10, "#8eeeff");
+  drawPixelRect(x + 7, y + 4, 10, 2, "#dffcff");
+  drawPixelRect(x + 6, y + 7, 12, 5, "#22354f");
+  drawPixelRect(x + 8, y + 8, 8, 4, "#ff9aca");
+  drawPixelRect(x + 9, y + 6, 6, 1, "#fff2fb");
+
+  if (blink) {
+    drawPixelRect(x + 9, y + 9, 2, 1, "#dffcff");
+    drawPixelRect(x + 13, y + 9, 2, 1, "#dffcff");
+  } else {
+    drawPixelRect(x + 9, y + 8, 2, 2, "#dffcff");
+    drawPixelRect(x + 13, y + 8, 2, 2, "#dffcff");
+  }
+
+  drawPixelRect(x + 10, y + 11, mouthPulse ? 5 : 3, 1, "#dffcff");
+  if (receiving) {
+    drawPixelRect(x + 2, y + 6, 2, 1, "#ffb9de");
+    drawPixelRect(x + 20, y + 6, 2, 1, "#ffb9de");
+  }
+  drawPixelRect(x + 3, y + 14, 18, 2, "rgba(104, 220, 255, 0.28)");
+}
+
+function drawBossMonitor(nowMs: number) {
+  const backgroundScene = Boolean(roomBackgroundImage);
+  const rect = getBossMonitorRect(backgroundScene);
+  const pulse = 0.58 + Math.sin(nowMs * 0.0048) * 0.24;
+  const activeAccent =
+    bossMonitorState.mode === "receiving"
+      ? "rgba(255, 148, 209, 0.24)"
+      : bossMonitorState.mode === "dispatching"
+        ? "rgba(145, 255, 196, 0.26)"
+        : "rgba(79, 229, 255, 0.16)";
+
+  ctx.fillStyle = activeAccent;
+  ctx.fillRect(rect.x - 3, rect.y - 3, rect.width + 6, rect.height + 6);
+  ctx.fillStyle = "#15263a";
+  ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+  ctx.fillStyle = "#273a55";
+  ctx.fillRect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height - 4);
+  ctx.fillStyle = "#081520";
+  ctx.fillRect(rect.x + 5, rect.y + 8, rect.width - 10, rect.height - 16);
+  ctx.fillStyle = `rgba(114, 238, 255, ${pulse.toFixed(2)})`;
+  ctx.fillRect(rect.x + 6, rect.y + 9, rect.width - 12, rect.height - 18);
+  if (bossMonitorState.mode === "receiving") {
+    ctx.fillStyle = "rgba(255, 174, 221, 0.22)";
+    ctx.fillRect(rect.x + 8, rect.y + 11, rect.width - 16, rect.height - 22);
+  } else if (bossMonitorState.mode === "dispatching") {
+    ctx.fillStyle = "rgba(159, 255, 207, 0.18)";
+    ctx.fillRect(rect.x + 8, rect.y + 11, rect.width - 16, rect.height - 22);
+  }
+  ctx.fillStyle = "rgba(244, 252, 255, 0.3)";
+  ctx.fillRect(rect.x + 7, rect.y + 10, rect.width - 14, 2);
+
+  if (bossMonitorState.mode !== "idle") {
+    const pingColor =
+      bossMonitorState.mode === "receiving" ? "#ffb6df" : "#a9ffd5";
+    for (let i = 0; i < 3; i += 1) {
+      const pingOffset = Math.sin(nowMs * 0.01 + i * 0.8) > 0 ? 1 : 0;
+      drawPixelRect(rect.x + 8 + i * 6, rect.y + 4 - pingOffset, 3, 1, pingColor);
+    }
+  }
+
+  drawBossHeadSprite(
+    rect.x + Math.floor(rect.width / 2) - 12,
+    rect.y + Math.floor(rect.height / 2) - 7,
+    nowMs,
+    bossMonitorState.mode,
+  );
+
+  ctx.fillStyle = "#e7fbff";
+  ctx.font = "bold 6px monospace";
+  ctx.fillText("OPS AI", rect.x + 8, rect.y + 7);
+
+  ctx.fillStyle = "#89dff8";
+  ctx.fillRect(rect.x + 6, rect.y + rect.height - 5, rect.width - 12, 1);
+  ctx.fillStyle = "#1c2f48";
+  ctx.fillRect(rect.x + Math.floor(rect.width / 2) - 6, rect.y + rect.height, 12, 3);
+}
+
+function drawBossDispatchLink(nowMs: number) {
+  if (
+    bossMonitorState.mode !== "dispatching" ||
+    !bossMonitorState.targetAgentId
+  ) {
+    return;
+  }
+
+  const target = agentState[bossMonitorState.targetAgentId];
+  if (!target) {
+    return;
+  }
+
+  const rect = getBossMonitorRect(Boolean(roomBackgroundImage));
+  const startX = rect.x + Math.floor(rect.width / 2);
+  const startY = rect.y + rect.height + 2;
+  const endX = Math.floor(target.x + 10);
+  const endY = Math.floor(target.y - 8 + Math.sin(nowMs * 0.004 + target.bob));
+
+  const pulse = Math.floor(nowMs / 90) % 3;
+  for (let i = 0; i <= 12; i += 1) {
+    if ((i + pulse) % 3 === 0) {
+      continue;
+    }
+    const progress = i / 12;
+    const px = Math.round(startX + (endX - startX) * progress);
+    const py = Math.round(startY + (endY - startY) * progress);
+    drawPixelRect(px, py, 2, 1, "#a9ffd5");
+  }
+}
+
+function drawBossSpeechCloud(nowEpochMs: number) {
+  if (!isBossSpeechVisible(nowEpochMs)) {
+    return;
+  }
+
+  const rect = getBossMonitorRect(Boolean(roomBackgroundImage));
+  const lines = wrapBubbleText(
+    `Ops AI: ${bossMonitorState.speechText}`,
+    28,
+    3,
+  );
+  if (lines.length === 0) {
+    return;
+  }
+
+  ctx.font = "8px monospace";
+  const textWidth = Math.max(
+    ...lines.map((line) => Math.ceil(ctx.measureText(line).width)),
+  );
+  const bubbleWidth = Math.max(92, textWidth + 12);
+  const bubbleHeight = 6 + lines.length * 9;
+  const x = clamp(
+    rect.x + rect.width + 8,
+    BUBBLE_EDGE_MARGIN_PX,
+    canvas.width - bubbleWidth - BUBBLE_EDGE_MARGIN_PX,
+  );
+  const y = clamp(
+    rect.y,
+    BUBBLE_EDGE_MARGIN_PX,
+    canvas.height - bubbleHeight - BUBBLE_EDGE_MARGIN_PX,
+  );
+
+  ctx.fillStyle = "#f7fbff";
+  ctx.fillRect(x, y, bubbleWidth, bubbleHeight);
+  ctx.fillStyle = "#2d3850";
+  ctx.fillRect(x, y, bubbleWidth, 1);
+  ctx.fillRect(x, y + bubbleHeight - 1, bubbleWidth, 1);
+  ctx.fillRect(x, y, 1, bubbleHeight);
+  ctx.fillRect(x + bubbleWidth - 1, y, 1, bubbleHeight);
+  ctx.fillRect(x - 3, y + 10, 3, 2);
+  ctx.fillRect(x - 5, y + 11, 2, 1);
+
+  ctx.fillStyle = "#20283a";
+  for (let index = 0; index < lines.length; index += 1) {
+    ctx.fillText(lines[index], x + 5, y + 8 + index * 9);
+  }
+}
+
+function drawAmbientWallPanel(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  pulse: number,
+) {
+  ctx.fillStyle = "#123150";
+  ctx.fillRect(x, y, width, height);
+  ctx.fillStyle = "#5b7999";
+  ctx.fillRect(x + 1, y + 1, width - 2, height - 2);
+  ctx.fillStyle = "#0f253f";
+  ctx.fillRect(x + 2, y + 2, width - 4, height - 4);
+
+  const glow = 154 + Math.floor(66 * Math.sin(pulse));
+  ctx.fillStyle = `rgb(${Math.max(60, glow - 44)}, ${Math.min(
+    255,
+    glow + 36,
+  )}, 255)`;
+  ctx.fillRect(x + 3, y + 3, width - 6, height - 6);
+
+  const sweep = ((Math.floor(pulse * 38) + x + y) % (width - 4)) + 2;
+  ctx.fillStyle = "rgba(235, 251, 255, 0.44)";
+  ctx.fillRect(x + sweep, y + 3, 1, height - 6);
+}
+
+function drawRoomBackground(nowMs: number): boolean {
+  if (!roomBackgroundImage) {
+    return false;
+  }
+
+  const imageWidth = roomBackgroundImage.naturalWidth || roomBackgroundImage.width;
+  const imageHeight =
+    roomBackgroundImage.naturalHeight || roomBackgroundImage.height;
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return false;
+  }
+
+  const targetAspect = canvas.width / canvas.height;
+  const sourceAspect = imageWidth / imageHeight;
+  let sourceX = 0;
+  let sourceY = 0;
+  let sourceWidth = imageWidth;
+  let sourceHeight = imageHeight;
+
+  if (sourceAspect > targetAspect) {
+    sourceWidth = imageHeight * targetAspect;
+    sourceX = Math.floor((imageWidth - sourceWidth) / 2);
+  } else {
+    sourceHeight = imageWidth / targetAspect;
+    const verticalBias = 0.47;
+    sourceY = Math.floor((imageHeight - sourceHeight) * verticalBias);
+  }
+
+  ctx.save();
+  ctx.globalAlpha = ROOM_BACKGROUND_ALPHA;
+  ctx.drawImage(
+    roomBackgroundImage,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  );
+  ctx.restore();
+
+  if (ROOM_BACKGROUND_OVERLAY_BASE_ALPHA > 0) {
+    const glow =
+      ROOM_BACKGROUND_OVERLAY_BASE_ALPHA + Math.sin(nowMs * 0.0019) * 0.02;
+    ctx.fillStyle = `rgba(10, 18, 31, ${glow.toFixed(3)})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  return true;
 }
 
 function collectWorkstationActivity(): Map<string, WorkstationActivity> {
@@ -1686,17 +2775,19 @@ function collectWorkstationActivity(): Map<string, WorkstationActivity> {
 function drawWorkstation(
   station: WorkstationSpot,
   pulse: number,
+  nowMs: number,
   activity?: WorkstationActivity,
 ) {
   const x = station.deskX;
   const y = station.deskY;
+  const backgroundScene = Boolean(roomBackgroundImage);
+  const screenRect = getWorkstationScreenRect(station);
   const occupied = Boolean(activity && activity.occupied > 0);
+  const hasError = Boolean(activity && activity.error > 0);
+  const hasWorking = Boolean(activity && activity.working > 0);
+  const hasCompleted = Boolean(activity && activity.completed > 0);
 
   if (occupied) {
-    const hasError = Boolean(activity && activity.error > 0);
-    const hasWorking = Boolean(activity && activity.working > 0);
-    const hasCompleted = Boolean(activity && activity.completed > 0);
-
     const glowColor = hasError
       ? "rgba(255, 110, 160, 0.35)"
       : hasWorking
@@ -1705,22 +2796,41 @@ function drawWorkstation(
           ? "rgba(120, 255, 190, 0.3)"
           : "rgba(210, 230, 255, 0.22)";
 
-    const glowSize = 46 + Math.floor(5 * Math.sin(pulse));
+    const glowSize = station.facing === "north" ? 46 : 18;
     ctx.fillStyle = glowColor;
-    ctx.fillRect(x - 2, y - 14, glowSize, 18);
+    if (station.facing === "north") {
+      ctx.fillRect(x - 2, y - 14, glowSize, 18);
+    } else if (station.facing === "east") {
+      ctx.fillRect(x + 2, y - 2, 16, 34);
+    } else {
+      ctx.fillRect(x - 6, y - 2, 16, 34);
+    }
   }
 
-  ctx.fillStyle = stationRoleDeskColor(station.role);
-  ctx.fillRect(x, y, 42, 11);
-  ctx.fillStyle = "#9fb3c8";
-  ctx.fillRect(x + 2, y + 11, 38, 2);
-
-  ctx.fillStyle = "#f1f8ff";
-  ctx.fillRect(x + 14, y - 11, 14, 9);
-
-  const glow = 205 + Math.floor(30 * Math.sin(pulse));
-  ctx.fillStyle = stationRoleMonitorColor(station.role, glow);
-  ctx.fillRect(x + 15, y - 10, 12, 7);
+  if (!backgroundScene) {
+    if (station.facing === "north") {
+      ctx.fillStyle = stationRoleDeskColor(station.role);
+      ctx.fillRect(x, y, 42, 11);
+      ctx.fillStyle = "#a2b7cd";
+      ctx.fillRect(x + 2, y + 11, 38, 2);
+      ctx.fillStyle = "#7f93ab";
+      ctx.fillRect(x + 5, y + 4, 7, 3);
+      ctx.fillRect(x + 29, y + 4, 7, 3);
+      ctx.fillStyle = "#44597a";
+      ctx.fillRect(x + 13, y - 1, 16, 1);
+    } else {
+      ctx.fillStyle = stationRoleDeskColor(station.role);
+      ctx.fillRect(x, y, 12, 34);
+      ctx.fillStyle = "#a6bacf";
+      ctx.fillRect(x + 1, y + 2, 10, 29);
+      ctx.fillStyle = "#304865";
+      ctx.fillRect(x + 2, y + 3, 8, 8);
+      ctx.fillStyle = "#889eb8";
+      ctx.fillRect(x + 2, y + 13, 8, 2);
+      ctx.fillRect(x + 2, y + 17, 8, 2);
+      ctx.fillRect(x + 2, y + 21, 8, 2);
+    }
+  }
 
   if (occupied) {
     const ringColor =
@@ -1730,24 +2840,38 @@ function drawWorkstation(
           ? "#8cf6ff"
           : "#b7ffc9";
     ctx.strokeStyle = ringColor;
-    ctx.strokeRect(x + 13, y - 12, 16, 11);
+    ctx.strokeRect(
+      screenRect.x - 2,
+      screenRect.y - 2,
+      screenRect.width + 4,
+      screenRect.height + 4,
+    );
   }
 
-  ctx.fillStyle = "#7f93ab";
-  ctx.fillRect(x + 6, y + 3, 7, 3);
-  ctx.fillRect(x + 28, y + 3, 7, 3);
+  drawWorkstationScreen(station, nowMs, pulse, activity);
 
-  ctx.fillStyle = "#2f3b4f";
-  ctx.fillRect(station.x - 3, station.y + 7, 6, 4);
-  ctx.fillStyle = "#55667f";
-  ctx.fillRect(station.x - 2, station.y + 6, 4, 1);
+  if (backgroundScene) {
+    ctx.fillStyle = occupied ? "rgba(176, 244, 255, 0.85)" : "rgba(104, 136, 168, 0.8)";
+    ctx.fillRect(station.x - 2, station.y + 7, 4, 3);
+  } else {
+    ctx.fillStyle = "#2f3b4f";
+    ctx.fillRect(station.x - 3, station.y + 7, 6, 4);
+    ctx.fillStyle = "#55667f";
+    ctx.fillRect(station.x - 2, station.y + 6, 4, 1);
+  }
 
   ctx.font = "6px monospace";
-  ctx.fillStyle = occupied ? "#dff8ff" : "#9fb2c7";
+  ctx.fillStyle = occupied
+    ? backgroundScene
+      ? "#e6f6ff"
+      : "#dff8ff"
+    : backgroundScene
+      ? "#b9cade"
+      : "#9fb2c7";
   ctx.fillText(
     `${stationRoleCode(station.role)}${station.id.slice(-1)}`,
-    x + 15,
-    y + 20,
+    backgroundScene ? screenRect.x : x + 15,
+    backgroundScene ? screenRect.y - 4 : y + 20,
   );
 }
 
@@ -1755,12 +2879,50 @@ function drawScene(nowMs: number) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const activityByStation = collectWorkstationActivity();
 
-  // Outer void
-  ctx.fillStyle = "#05080f";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // Trigger idle overlays/extra idle events
+  maybeTriggerIdleOverlay(nowMs);
 
-  // Octagonal room shell inspired by the provided pixel room
-  const roomPoly: ReadonlyArray<Spot> = [
+  const hasBitmapBackground = drawRoomBackground(nowMs);
+  if (hasBitmapBackground) {
+    const activePulse = 0.18 + Math.sin(nowMs * 0.0028) * 0.08;
+    ctx.fillStyle = `rgba(136, 237, 255, ${activePulse.toFixed(3)})`;
+    for (const spot of IDLE_SPOTS) {
+      ctx.fillRect(spot.x - 2, spot.y + 8, 4, 2);
+    }
+
+    const plantPulse = 0.22 + Math.sin(nowMs * 0.0042) * 0.06;
+    ctx.fillStyle = `rgba(120, 255, 196, ${plantPulse.toFixed(3)})`;
+    ctx.fillRect(PLANT_CARE_SPOT.x - 2, PLANT_CARE_SPOT.y + 7, 4, 2);
+
+    ctx.fillStyle = "rgba(255, 213, 236, 0.26)";
+    ctx.fillRect(BED_SPOT.x - 9, BED_SPOT.y + 7, 18, 2);
+
+    WORKSTATIONS.forEach((station, index) => {
+      drawWorkstation(
+        station,
+        nowMs * 0.004 + index * 1.7,
+        nowMs,
+        activityByStation.get(station.id),
+      );
+    });
+
+    drawBossMonitor(nowMs);
+
+    ctx.font = "bold 8px monospace";
+    ctx.fillStyle = "#9fefff";
+    ctx.fillText("RESEARCH", roomX(73), roomY(33));
+    ctx.fillStyle = "#ffe7af";
+    ctx.fillText("ENGINEERING", roomX(178), roomY(33));
+    ctx.fillStyle = "#f8b5de";
+    ctx.fillText("QA", roomX(43), roomY(67));
+    ctx.fillStyle = "#c8f2ff";
+    ctx.fillText("IDLE", roomX(146), roomY(98));
+    ctx.fillStyle = "#f0d7e8";
+    ctx.fillText("LOUNGE", roomX(60), roomY(125));
+    return;
+  }
+
+  const shellPoly: ReadonlyArray<Spot> = [
     { x: 34, y: 8 },
     { x: 286, y: 8 },
     { x: 312, y: 34 },
@@ -1772,99 +2934,120 @@ function drawScene(nowMs: number) {
   ];
 
   ctx.beginPath();
-  ctx.moveTo(roomPoly[0].x, roomPoly[0].y);
-  for (let i = 1; i < roomPoly.length; i += 1) {
-    ctx.lineTo(roomPoly[i].x, roomPoly[i].y);
+  ctx.moveTo(shellPoly[0].x, shellPoly[0].y);
+  for (let i = 1; i < shellPoly.length; i += 1) {
+    ctx.lineTo(shellPoly[i].x, shellPoly[i].y);
   }
   ctx.closePath();
-  const shellGradient = ctx.createLinearGradient(
-    0,
-    0,
-    canvas.width,
-    canvas.height,
-  );
-  shellGradient.addColorStop(0, "#aebfd1");
-  shellGradient.addColorStop(1, "#8296ac");
-  ctx.fillStyle = shellGradient;
+  ctx.fillStyle = "#b8cadb";
   ctx.fill();
+  ctx.strokeStyle = "#e7f3ff";
+  ctx.lineWidth = 1;
+  ctx.stroke();
 
   ctx.beginPath();
-  ctx.moveTo(40, 20);
-  ctx.lineTo(280, 20);
-  ctx.lineTo(300, 40);
-  ctx.lineTo(300, 140);
-  ctx.lineTo(280, 160);
-  ctx.lineTo(40, 160);
-  ctx.lineTo(20, 140);
-  ctx.lineTo(20, 40);
+  ctx.moveTo(42, 18);
+  ctx.lineTo(278, 18);
+  ctx.lineTo(298, 38);
+  ctx.lineTo(298, 142);
+  ctx.lineTo(278, 162);
+  ctx.lineTo(42, 162);
+  ctx.lineTo(22, 142);
+  ctx.lineTo(22, 38);
   ctx.closePath();
-  ctx.fillStyle = "#254363";
+  ctx.fillStyle = "#0f3153";
   ctx.fill();
 
-  // Central walkway
-  ctx.fillStyle = "#d9e4ee";
+  ctx.fillStyle = "#1d466d";
+  ctx.fillRect(36, 40, 248, 118);
+  ctx.fillStyle = "#d8e3eb";
   ctx.fillRect(146, 40, 28, 118);
-  ctx.fillStyle = "#9fb0c2";
+  ctx.fillStyle = "#afc1d0";
   ctx.fillRect(150, 40, 20, 118);
 
-  // Floor tiles
-  ctx.fillStyle = "#315372";
-  ctx.fillRect(34, 40, 252, 118);
+  ctx.fillStyle = "#b6c7d4";
+  ctx.fillRect(136, 17, 48, 34);
+  ctx.fillStyle = "#6d8ba8";
+  ctx.fillRect(141, 24, 38, 27);
+  ctx.fillStyle = "#edf7ff";
+  ctx.fillRect(146, 29, 28, 18);
+  ctx.fillStyle = "#8fdfff";
+  ctx.fillRect(151, 20, 18, 3);
+
+  ctx.fillStyle = "#4f6f8f";
+  ctx.fillRect(34, 40, 252, 2);
+  ctx.fillRect(34, 156, 252, 2);
+
   for (let x = 34; x <= 286; x += 18) {
-    ctx.strokeStyle = "rgba(173, 202, 227, 0.45)";
+    ctx.strokeStyle = "rgba(166, 201, 228, 0.44)";
     ctx.beginPath();
     ctx.moveTo(x, 40);
     ctx.lineTo(x, 158);
     ctx.stroke();
   }
   for (let y = 40; y <= 158; y += 18) {
-    ctx.strokeStyle = "rgba(173, 202, 227, 0.45)";
+    ctx.strokeStyle = "rgba(166, 201, 228, 0.44)";
     ctx.beginPath();
     ctx.moveTo(34, y);
     ctx.lineTo(286, y);
     ctx.stroke();
   }
 
-  const pulseA = 0.48 + Math.sin(nowMs * 0.0021) * 0.24;
-  const pulseB = 0.44 + Math.cos(nowMs * 0.0023) * 0.24;
+  const pulseA = 0.5 + Math.sin(nowMs * 0.0022) * 0.24;
+  const pulseB = 0.46 + Math.cos(nowMs * 0.0024) * 0.25;
+  ctx.fillStyle = `rgba(110, 234, 255, ${pulseA.toFixed(2)})`;
+  ctx.fillRect(49, 24, 94, 3);
+  ctx.fillRect(177, 24, 94, 3);
+  ctx.fillStyle = `rgba(110, 234, 255, ${pulseB.toFixed(2)})`;
+  ctx.fillRect(50, 154, 93, 3);
+  ctx.fillRect(177, 154, 93, 3);
 
-  // Neon wall strips
-  ctx.fillStyle = `rgba(102, 232, 255, ${pulseA.toFixed(2)})`;
-  ctx.fillRect(48, 24, 96, 3);
-  ctx.fillRect(176, 24, 96, 3);
-  ctx.fillStyle = `rgba(102, 232, 255, ${pulseB.toFixed(2)})`;
-  ctx.fillRect(48, 154, 96, 3);
-  ctx.fillRect(176, 154, 96, 3);
+  drawAmbientWallPanel(22, 30, 14, 17, nowMs * 0.0041);
+  drawAmbientWallPanel(284, 30, 14, 17, nowMs * 0.0044);
+  drawAmbientWallPanel(27, 78, 10, 22, nowMs * 0.0047);
+  drawAmbientWallPanel(283, 78, 10, 22, nowMs * 0.0049);
+  drawAmbientWallPanel(43, 147, 56, 10, nowMs * 0.0043);
+  drawAmbientWallPanel(221, 147, 56, 10, nowMs * 0.0039);
 
-  // Bed area
-  ctx.fillStyle = "#dce6ef";
-  ctx.fillRect(58, 132, 56, 20);
-  ctx.fillStyle = "#f7fbff";
-  ctx.fillRect(62, 136, 48, 8);
+  ctx.fillStyle = "#dae4ed";
+  ctx.fillRect(58, 131, 56, 21);
+  ctx.fillStyle = "#f5fafe";
+  ctx.fillRect(62, 135, 48, 9);
   ctx.fillStyle = "#95a8bb";
   ctx.fillRect(60, 145, 52, 3);
+  ctx.fillStyle = "#f7fdff";
+  ctx.fillRect(58, 134, 6, 7);
+  ctx.fillRect(108, 134, 6, 7);
 
-  // Workstations
+  ctx.fillStyle = "#5a7796";
+  ctx.fillRect(154, 145, 12, 20);
+  ctx.fillStyle = "#9fb4c9";
+  ctx.fillRect(156, 147, 8, 16);
+  ctx.fillStyle = "#77dfff";
+  ctx.fillRect(157, 149, 6, 4);
+
   WORKSTATIONS.forEach((station, index) => {
     drawWorkstation(
       station,
       nowMs * 0.004 + index * 1.7,
+      nowMs,
       activityByStation.get(station.id),
     );
   });
 
-  // Room labels
+  drawBossMonitor(nowMs);
+
   ctx.font = "bold 8px monospace";
   ctx.fillStyle = "#9fefff";
-  ctx.fillText("RESEARCH", 70, 34);
+  ctx.fillText("RESEARCH", 62, 33);
   ctx.fillStyle = "#ffe7af";
-  ctx.fillText("ENGINEERING", 198, 34);
+  ctx.fillText("ENGINEERING", 182, 33);
   ctx.fillStyle = "#f8b5de";
-  ctx.fillText("QA", 44, 79);
+  ctx.fillText("QA", 45, 73);
   ctx.fillStyle = "#c8f2ff";
-  ctx.fillText("MIDDEN", 142, 95);
+  ctx.fillText("IDLE", 145, 96);
   ctx.fillStyle = "#f0d7e8";
-  ctx.fillText("RUSTBED", 62, 129);
+  ctx.fillText("LOUNGE", 63, 127);
 }
 
 function resolveAgentBodyColor(
@@ -1912,6 +3095,59 @@ function drawMangaBadge(agent: AgentVisualState, x: number, y: number) {
   ctx.fillText(text, x, y - 4);
 }
 
+function drawMangaSpeedLines(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  color: string,
+  seed: number,
+) {
+  for (let i = 0; i < 5; i += 1) {
+    const wave = Math.sin(seed * 0.01 + i * 0.9);
+    const lineX = x - 5 + i * 5 + Math.round(wave * 2);
+    const lineY = y - 4 + i * 3;
+    const lineHeight = Math.max(3, Math.floor(height * 0.3));
+    drawPixelRect(lineX, lineY, 1, lineHeight, color);
+    drawPixelRect(lineX + width + 2, lineY + 1, 1, lineHeight - 1, color);
+  }
+}
+
+function drawMangaSpark(x: number, y: number, color: string) {
+  drawPixelRect(x, y, 1, 1, color);
+  drawPixelRect(x - 1, y, 3, 1, color);
+  drawPixelRect(x, y - 1, 1, 3, color);
+}
+
+function drawPlantWateringEffect(
+  agent: AgentVisualState,
+  x: number,
+  y: number,
+  nowMs: number,
+) {
+  const canX = x + 17;
+  const canY = y + 15 + Math.round(Math.sin(nowMs * 0.017 + agent.bob) * 1.2);
+  drawPixelRect(canX - 1, canY, 5, 3, "#425369");
+  drawPixelRect(canX, canY + 1, 3, 1, "#8ca7c6");
+  drawPixelRect(canX + 4, canY + 1, 2, 1, "#425369");
+  drawPixelRect(canX + 1, canY - 1, 2, 1, "#425369");
+
+  const flowStep = Math.floor(nowMs / 120) % 5;
+  for (let i = 0; i < 5; i += 1) {
+    const progress = (i + flowStep * 0.35) / 4.6;
+    const dripX = Math.round(
+      canX + 4 + (PLANT_WATER_TARGET.x - (canX + 4)) * progress,
+    );
+    const dripY = Math.round(
+      canY + 2 + (PLANT_WATER_TARGET.y - (canY + 2)) * progress,
+    );
+    drawPixelRect(dripX, dripY, 1, 2, "#97edff");
+  }
+
+  const leafPulse = Math.sin(nowMs * 0.013 + agent.bob) > 0 ? "#9ff7c5" : "#7fe2b3";
+  drawPixelRect(PLANT_WATER_TARGET.x - 1, PLANT_WATER_TARGET.y - 1, 3, 2, leafPulse);
+}
+
 function drawSpriteCharacter(
   agent: AgentVisualState,
   x: number,
@@ -1920,67 +3156,185 @@ function drawSpriteCharacter(
   nowMs: number,
   routineDance: boolean,
   routineSleep: boolean,
+  routinePause: boolean,
 ) {
-  if (!spriteSheetImage || !agent.spriteRect) {
-    return;
-  }
-
-  const source = agent.spriteRect;
   const palette = AGENT_MANGA_PALETTES[agent.id];
-  const targetHeight = 34;
-  const targetWidth = Math.max(
-    16,
-    Math.round((source.width / source.height) * targetHeight),
-  );
-  const centerX = x + 8;
-  const danceShift = routineDance ? Math.sin(nowMs * 0.03 + agent.bob) * 2 : 0;
-  const drawX = Math.floor(centerX - targetWidth / 2 + step * 0.5);
-  const drawY = Math.floor(y - 3 + danceShift);
+  const bodyColor = resolveAgentBodyColor(agent, palette);
+  const variant =
+    (Math.floor(nowMs / 1500) + agent.id.length + Math.abs(agent.lane)) % 3;
+  const eyeClosed =
+    routineSleep || Math.sin(nowMs * 0.022 + agent.bob * 5.8) > 0.93;
+  const danceLift = routineDance ? Math.sin(nowMs * 0.03 + agent.bob) * 3.2 : 0;
+  const torsoSway = Math.sin(nowMs * 0.009 + agent.bob) * 1.2 + danceLift * 0.35;
+  const stride = routineSleep
+    ? 0
+    : routineDance
+      ? Math.sin(nowMs * 0.03 + agent.bob) > 0
+        ? 2
+        : -2
+      : step * 2;
+  const actionLean = agent.status === "working" ? Math.sign(agent.vx || 1) : 0;
 
-  drawPixelRect(
-    drawX + Math.floor(targetWidth * 0.2),
-    y + 29,
-    Math.max(8, Math.floor(targetWidth * 0.62)),
-    2,
-    "rgba(86, 102, 129, 0.32)",
-  );
+  const drawX = Math.floor(x - 2 + actionLean + stride * 0.2);
+  const drawY = Math.floor(y - 7 + torsoSway + (routinePause ? 1 : 0));
 
-  const previousSmoothing = ctx.imageSmoothingEnabled;
-  ctx.save();
-  ctx.imageSmoothingEnabled = false;
-  if (routineSleep) {
-    ctx.globalAlpha = 0.9;
+  drawPixelRect(drawX + 3, drawY + 36, 14, 2, "rgba(90, 104, 130, 0.34)");
+
+  if (agent.status === "working") {
+    drawMangaSpeedLines(
+      drawX,
+      drawY + 6,
+      18,
+      24,
+      "rgba(167, 237, 255, 0.44)",
+      nowMs + agent.bob * 37,
+    );
   }
-  ctx.drawImage(
-    spriteSheetImage,
-    source.x,
-    source.y,
-    source.width,
-    source.height,
-    drawX,
-    drawY,
-    targetWidth,
-    targetHeight,
-  );
-  ctx.restore();
-  ctx.imageSmoothingEnabled = previousSmoothing;
+
+  if (routineDance) {
+    drawMangaSpeedLines(
+      drawX + 1,
+      drawY + 2,
+      16,
+      18,
+      "rgba(255, 168, 216, 0.4)",
+      nowMs + 400 + agent.bob * 29,
+    );
+  }
+
+  const coatWave = Math.round(Math.sin(nowMs * 0.015 + agent.bob) * 1.8);
+  const armLift =
+    routineDance || agent.status === "working"
+      ? Math.round(Math.sin(nowMs * 0.024 + agent.bob) * 2)
+      : 0;
+
+  drawPixelRect(drawX + 5, drawY + 22 + stride, 3, 9, palette.outline);
+  drawPixelRect(drawX + 11, drawY + 22 - stride, 3, 9, palette.outline);
+  drawPixelRect(drawX + 6, drawY + 23 + stride, 1, 7, palette.coat);
+  drawPixelRect(drawX + 12, drawY + 23 - stride, 1, 7, palette.coat);
+
+  drawPixelRect(drawX + 4, drawY + 31 + stride, 5, 2, palette.outline);
+  drawPixelRect(drawX + 10, drawY + 31 - stride, 5, 2, palette.outline);
+  drawPixelRect(drawX + 5, drawY + 31 + stride, 3, 1, palette.accent);
+  drawPixelRect(drawX + 11, drawY + 31 - stride, 3, 1, palette.accent);
+
+  drawPixelRect(drawX + 3, drawY + 14 + armLift, 3, 9, palette.outline);
+  drawPixelRect(drawX + 14, drawY + 14 - armLift, 3, 9, palette.outline);
+  drawPixelRect(drawX + 4, drawY + 15 + armLift, 1, 7, palette.coat);
+  drawPixelRect(drawX + 15, drawY + 15 - armLift, 1, 7, palette.coat);
+
+  drawPixelRect(drawX + 5, drawY + 12, 10, 12, palette.outline);
+  drawPixelRect(drawX + 6, drawY + 13, 8, 10, bodyColor);
+  drawPixelRect(drawX + 6, drawY + 18, 8, 5, palette.coat);
+  drawPixelRect(drawX + 7, drawY + 14, 6, 2, palette.coatShade);
+  drawPixelRect(drawX + 8, drawY + 17, 4, 1, palette.accent);
+
+  drawPixelRect(drawX + 4 + coatWave, drawY + 22, 4, 8, palette.coatShade);
+  drawPixelRect(drawX + 12 + coatWave, drawY + 22, 4, 8, palette.coatShade);
+  drawPixelRect(drawX + 5 + coatWave, drawY + 25, 3, 4, palette.coat);
+  drawPixelRect(drawX + 12 + coatWave, drawY + 25, 3, 4, palette.coat);
+
+  drawPixelRect(drawX + 8, drawY + 10, 4, 2, palette.skin);
+
+  const headY = drawY + (routineSleep ? 2 : 0);
+  drawPixelRect(drawX + 4, headY + 1, 12, 12, palette.outline);
+  drawPixelRect(drawX + 5, headY + 2, 10, 10, palette.skin);
+  drawPixelRect(drawX + 4, headY - 2, 12, 5, palette.hair);
+  drawPixelRect(drawX + 5, headY, 10, 3, palette.hairShade);
+  drawPixelRect(drawX + 8, headY - 1, 4, 1, "#ffe8f5");
+
+  if (agent.id === "scout") {
+    drawPixelRect(drawX + 3, headY + 1, 2, 6, palette.hair);
+    drawPixelRect(drawX + 13, headY + 2, 2, 6, palette.hairShade);
+    if (variant === 1) {
+      drawPixelRect(drawX + 2, headY - 1, 2, 2, palette.hair);
+    }
+    if (variant === 2) {
+      drawPixelRect(drawX + 12, headY - 1, 3, 2, palette.hairShade);
+    }
+  } else if (agent.id === "builder") {
+    drawPixelRect(drawX + 5, headY + 1, 7, 2, palette.hair);
+    drawPixelRect(drawX + 11, headY + 1, 3, 7, palette.hairShade);
+    drawPixelRect(drawX + 12, headY + 8, 1, 1, palette.hair);
+    if (variant === 1) {
+      drawPixelRect(drawX + 4, headY - 1, 3, 2, palette.hair);
+    }
+    if (variant === 2) {
+      drawPixelRect(drawX + 7, headY - 2, 3, 1, palette.hairShade);
+    }
+  } else {
+    drawPixelRect(drawX + 5, headY + 2, 2, 7, palette.hair);
+    drawPixelRect(drawX + 13, headY + 2, 2, 7, palette.hair);
+    drawPixelRect(drawX + 5, headY + 8, 2, 4, palette.hairShade);
+    drawPixelRect(drawX + 13, headY + 8, 2, 4, palette.hairShade);
+    if (variant === 1) {
+      drawPixelRect(drawX + 8, headY - 2, 4, 1, palette.hair);
+    }
+    if (variant === 2) {
+      drawPixelRect(drawX + 9, headY - 1, 3, 1, palette.hairShade);
+    }
+  }
+
+  if (eyeClosed) {
+    drawPixelRect(drawX + 8, headY + 6, 2, 1, palette.outline);
+    drawPixelRect(drawX + 11, headY + 6, 2, 1, palette.outline);
+  } else {
+    drawPixelRect(drawX + 8, headY + 5, 2, 2, palette.visor);
+    drawPixelRect(drawX + 11, headY + 5, 2, 2, palette.visor);
+    drawPixelRect(drawX + 8, headY + 4, 1, 1, "#f8fdff");
+    drawPixelRect(drawX + 11, headY + 4, 1, 1, "#f8fdff");
+  }
+
+  drawPixelRect(drawX + 9, headY + 8, 3, 1, "#e5acb9");
+  drawPixelRect(drawX + 9, headY + 9, 2, 1, palette.outline);
+
+  if (agent.id === "scout") {
+    const scannerPulse = Math.sin(nowMs * 0.02 + agent.bob) > 0 ? palette.visor : palette.effect;
+    drawPixelRect(drawX + 16, drawY + 18 + armLift, 3, 4, palette.outline);
+    drawPixelRect(drawX + 17, drawY + 19 + armLift, 1, 2, scannerPulse);
+  } else if (agent.id === "builder") {
+    const swing = agent.status === "working" ? Math.round(Math.sin(nowMs * 0.03 + agent.bob) * 2) : 0;
+    drawPixelRect(drawX + 1, drawY + 18 - swing, 2, 8, palette.outline);
+    drawPixelRect(drawX - 1, drawY + 16 - swing, 6, 3, palette.accent);
+    drawPixelRect(drawX, drawY + 17 - swing, 4, 1, palette.effect);
+  } else {
+    const panelGlow = Math.sin(nowMs * 0.018 + agent.bob) > 0 ? palette.effect : palette.visor;
+    drawPixelRect(drawX + 1, drawY + 18, 5, 6, palette.outline);
+    drawPixelRect(drawX + 2, drawY + 19, 3, 4, panelGlow);
+    drawPixelRect(drawX + 2, drawY + 20, 2, 1, "#f6feff");
+  }
 
   if (agent.zone === "work" && agent.status === "working") {
-    const pulse =
-      Math.sin(nowMs * 0.018 + agent.bob) > 0 ? palette.effect : palette.accent;
-    drawPixelRect(drawX - 1, drawY - 1, targetWidth + 2, 1, pulse);
-    drawPixelRect(drawX - 1, drawY + targetHeight, targetWidth + 2, 1, pulse);
-  }
-  if (agent.status === "completed") {
-    drawPixelRect(drawX + targetWidth - 5, drawY + 2, 3, 2, "#e9fff1");
-    drawPixelRect(drawX + targetWidth - 6, drawY + 4, 2, 1, "#e9fff1");
-  }
-  if (agent.status === "error") {
-    drawPixelRect(drawX - 2, drawY + 11, 2, 1, "#ff7eb7");
-    drawPixelRect(drawX + targetWidth, drawY + 7, 2, 1, "#ff7eb7");
+    const pulse = Math.sin(nowMs * 0.018 + agent.bob) > 0 ? palette.effect : palette.accent;
+    drawPixelRect(drawX + 5, drawY + 11, 10, 1, pulse);
+    drawPixelRect(drawX + 4, drawY + 12, 1, 12, "rgba(128, 236, 255, 0.24)");
+    drawPixelRect(drawX + 15, drawY + 12, 1, 12, "rgba(255, 138, 205, 0.22)");
   }
 
-  drawMangaBadge(agent, drawX + Math.floor(targetWidth / 2) - 3, drawY + 1);
+  if (agent.status === "completed") {
+    drawMangaSpark(drawX + 2, drawY + 4, "#e7fff3");
+    drawMangaSpark(drawX + 17, drawY + 9, "#e7fff3");
+  }
+
+  if (agent.status === "error") {
+    drawPixelRect(drawX + 1, drawY + 17, 3, 1, "#ff7cb6");
+    drawPixelRect(drawX + 16, drawY + 13, 3, 1, "#ff7cb6");
+    drawPixelRect(drawX + 15, drawY + 14, 1, 3, "#ff7cb6");
+  }
+
+  if (routineSleep) {
+    ctx.font = "7px monospace";
+    ctx.fillStyle = "#f2f7ff";
+    ctx.fillText("z", drawX + 19, drawY + 6);
+    ctx.fillText("z", drawX + 21, drawY + 3);
+  }
+
+  if (routinePause) {
+    drawPixelRect(drawX + 16, headY + 4, 1, 2, "#dbe8f8");
+    drawPixelRect(drawX + 17, headY + 6, 1, 1, "#dbe8f8");
+  }
+
+  drawMangaBadge(agent, drawX + 6, drawY + 2);
 }
 
 function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
@@ -1988,139 +3342,88 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
   const routineSleep = agent.status === "idle" && agent.routine === "sleep";
   const routinePause = agent.status === "idle" && agent.routine === "pause";
 
+  // Idle-animatie: snelheid en amplitude per agent
+  const idleSpeed = AGENT_PERSONALITIES[agent.id].driftFreq;
+  const idleAmp = AGENT_PERSONALITIES[agent.id].driftAmp;
   const danceBoost = routineDance
     ? Math.sin(nowMs * 0.02 + agent.bob) * 1.8
     : 0;
-  const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5 + danceBoost;
+  const overlay = agentIdleOverlays[agent.id];
+  // Speciale idle-actie: zwaaien of telefoon
+  let extraWobble = 0;
+  let waving = false;
+  let phone = false;
+  let wateringPlant = false;
+  if (overlay && overlay.action === "wave") {
+    waving = true;
+    extraWobble = Math.sin(nowMs * 0.08 + agent.bob) * 2.5;
+  }
+  if (overlay && overlay.action === "phone") {
+    phone = true;
+    extraWobble = Math.sin(nowMs * 0.03 + agent.bob) * 1.2;
+  }
+  if (overlay && overlay.action === "water-plant") {
+    wateringPlant = true;
+    extraWobble = Math.sin(nowMs * 0.025 + agent.bob) * 1.1;
+  }
+  const wobble = Math.sin(nowMs * idleSpeed + agent.bob) * (1.5 + idleAmp * 8) + danceBoost + extraWobble;
   const x = Math.floor(agent.x);
   const y = Math.floor(agent.y + wobble - 16);
   const paused = nowMs < agent.pauseUntilMs || routinePause || routineSleep;
   const cadence =
-    agent.id === "builder" ? 14 : agent.id === "reviewer" ? 18 : 16;
+    agent.id === "builder" ? 16 : agent.id === "reviewer" ? 20 : 18;
   let step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
   if (routineDance) {
     step = Math.sin(nowMs * 0.03 + agent.bob) > 0 ? 1 : -1;
   }
 
-  if (spriteSheetImage && agent.spriteRect) {
-    drawSpriteCharacter(agent, x, y, step, nowMs, routineDance, routineSleep);
-    return;
+  drawSpriteCharacter(
+    agent,
+    x,
+    y,
+    step,
+    nowMs,
+    routineDance,
+    routineSleep,
+    routinePause,
+  );
+
+  if (wateringPlant) {
+    drawPlantWateringEffect(agent, x, y, nowMs);
   }
 
-  const palette = AGENT_MANGA_PALETTES[agent.id];
-  const bodyColor = resolveAgentBodyColor(agent, palette);
-  const accentPulse =
-    Math.sin(nowMs * 0.019 + agent.bob) > 0 ? palette.effect : palette.accent;
-
-  const legSwing = step;
-  const shinSwing = step === 0 ? 0 : step > 0 ? 1 : -1;
-
-  drawPixelRect(x + 2, y + 29, 12, 2, "rgba(100, 114, 138, 0.3)");
-
-  if (agent.id === "scout") {
-    drawPixelRect(x + 11, y + 10, 4, 2, palette.coatShade);
-    drawPixelRect(x + 13 + legSwing, y + 12, 2, 2, palette.accent);
-  } else if (agent.id === "builder") {
-    drawPixelRect(x + 1, y + 9, 2, 5, palette.coatShade);
-    drawPixelRect(x + 13, y + 9, 2, 5, palette.coatShade);
-  } else {
-    drawPixelRect(x + 2, y + 10, 2, 8, palette.hairShade);
-    drawPixelRect(x + 12, y + 10, 2, 8, palette.hairShade);
+  // Overlay-icoon boven hoofd
+  if (overlay) {
+    ctx.font = "20px serif";
+    ctx.textAlign = "center";
+    ctx.globalAlpha = 0.92;
+    ctx.fillText(overlay.icon, x + 10, y - 18);
+    ctx.globalAlpha = 1.0;
+    ctx.textAlign = "start";
   }
 
-  drawPixelRect(x + 3, y + 10 + legSwing, 2, 8, palette.outline);
-  drawPixelRect(x + 12, y + 10 - legSwing, 2, 8, palette.outline);
-  drawPixelRect(x + 4, y + 11 + legSwing, 1, 6, palette.coat);
-  drawPixelRect(x + 12, y + 11 - legSwing, 1, 6, palette.coat);
-
-  drawPixelRect(x + 6, y + 8, 2, 1, palette.skin);
-
-  drawPixelRect(x + 3, y + 8, 10, 10, palette.outline);
-  drawPixelRect(x + 4, y + 9, 8, 8, bodyColor);
-  drawPixelRect(x + 4, y + 13, 8, 4, palette.coat);
-  drawPixelRect(x + 5, y + 11, 6, 1, palette.coatShade);
-  drawPixelRect(x + 6, y + 14, 4, 1, palette.accent);
-  drawPixelRect(x + 3, y + 11, 1, 5, palette.accent);
-  drawPixelRect(x + 12, y + 11, 1, 5, palette.accent);
-
-  drawPixelRect(x + 5, y + 18 + legSwing, 2, 6, palette.outline);
-  drawPixelRect(x + 9, y + 18 - legSwing, 2, 6, palette.outline);
-  drawPixelRect(x + 5, y + 19 + legSwing, 2, 5, palette.coat);
-  drawPixelRect(x + 9, y + 19 - legSwing, 2, 5, palette.coat);
-  drawPixelRect(x + 5, y + 21 + legSwing, 2, 2, palette.accent);
-  drawPixelRect(x + 9, y + 21 - legSwing, 2, 2, palette.accent);
-
-  drawPixelRect(x + 5, y + 24 + legSwing + shinSwing, 2, 4, palette.outline);
-  drawPixelRect(x + 9, y + 24 - legSwing - shinSwing, 2, 4, palette.outline);
-  drawPixelRect(x + 5, y + 25 + legSwing + shinSwing, 2, 3, palette.coat);
-  drawPixelRect(x + 9, y + 25 - legSwing - shinSwing, 2, 3, palette.coat);
-
-  drawPixelRect(x + 4, y + 28 + legSwing + shinSwing, 3, 2, palette.outline);
-  drawPixelRect(x + 9, y + 28 - legSwing - shinSwing, 3, 2, palette.outline);
-  drawPixelRect(x + 5, y + 28 + legSwing + shinSwing, 2, 1, palette.accent);
-  drawPixelRect(x + 10, y + 28 - legSwing - shinSwing, 2, 1, palette.accent);
-
-  drawPixelRect(x + 4, y + 0, 8, 9, palette.outline);
-  drawPixelRect(x + 5, y + 1, 6, 7, palette.skin);
-  drawPixelRect(x + 3, y - 1, 10, 3, palette.hair);
-  drawPixelRect(x + 4, y + 1, 8, 2, palette.hairShade);
-  drawPixelRect(x + 6, y + 0, 4, 1, "#ffdff0");
-
-  if (agent.id === "scout") {
-    drawPixelRect(x + 3, y + 1, 2, 4, palette.hair);
-    drawPixelRect(x + 10, y + 2, 2, 4, palette.hairShade);
-    drawPixelRect(x + 2, y + 0, 1, 1, palette.hair);
-  } else if (agent.id === "builder") {
-    drawPixelRect(x + 4, y + 1, 5, 2, palette.hair);
-    drawPixelRect(x + 9, y + 1, 3, 5, palette.hairShade);
-    drawPixelRect(x + 10, y + 6, 1, 1, palette.hair);
-  } else {
-    drawPixelRect(x + 4, y + 2, 1, 4, palette.hair);
-    drawPixelRect(x + 11, y + 2, 1, 4, palette.hair);
-    drawPixelRect(x + 4, y + 6, 1, 4, palette.hairShade);
-    drawPixelRect(x + 11, y + 6, 1, 4, palette.hairShade);
+  if (agent.lastEventType === "codex.reasoning" && agent.status === "working") {
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "#eff8ff";
+    ctx.fillText("...?", x + 16, y - 12);
   }
 
-  if (routineSleep) {
-    drawPixelRect(x + 6, y + 4, 1, 1, palette.outline);
-    drawPixelRect(x + 9, y + 4, 1, 1, palette.outline);
-  } else {
-    drawPixelRect(x + 6, y + 4, 1, 1, palette.visor);
-    drawPixelRect(x + 9, y + 4, 1, 1, palette.visor);
-    drawPixelRect(x + 6, y + 3, 1, 1, "#f7fcff");
-    drawPixelRect(x + 9, y + 3, 1, 1, "#f7fcff");
+  // Extra visuele idle-actie: zwaaien of telefoon
+  if (waving) {
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "#ffb6e6";
+    ctx.fillText("zwaai!", x + 18, y - 8);
   }
-
-  drawPixelRect(x + 6, y + 5, 1, 1, palette.outline);
-  drawPixelRect(x + 9, y + 5, 1, 1, palette.outline);
-  drawPixelRect(x + 7, y + 6, 1, 1, "#e8b1ba");
-  drawPixelRect(x + 8, y + 6, 1, 1, "#e8b1ba");
-  drawPixelRect(x + 7, y + 7, 2, 1, palette.outline);
-
-  if (agent.id === "scout") {
-    drawPixelRect(x + 5, y + 3, 1, 1, "#f2bfd1");
-  } else if (agent.id === "builder") {
-    drawPixelRect(x + 10, y + 4, 1, 1, "#f2bfd1");
-  } else {
-    drawPixelRect(x + 5, y + 4, 1, 1, "#f2bfd1");
-    drawPixelRect(x + 10, y + 4, 1, 1, "#f2bfd1");
+  if (phone) {
+    ctx.font = "11px monospace";
+    ctx.fillStyle = "#b6e6ff";
+    ctx.fillText("scroll...", x + 18, y - 8);
   }
-
-  if (agent.zone === "work" && agent.status === "working") {
-    drawPixelRect(x + 3, y + 1, 10, 1, accentPulse);
-    drawPixelRect(x + 2, y + 2, 1, 8, "rgba(133, 226, 255, 0.26)");
-    drawPixelRect(x + 13, y + 2, 1, 8, "rgba(255, 140, 198, 0.2)");
+  if (wateringPlant) {
+    ctx.font = "11px monospace";
+    ctx.fillStyle = "#9ff7c5";
+    ctx.fillText("plant!", x + 18, y - 8);
   }
-  if (agent.status === "completed") {
-    drawPixelRect(x + 2, y + 0, 2, 1, "#e7fff1");
-    drawPixelRect(x + 12, y + 0, 2, 1, "#e7fff1");
-  }
-  if (agent.status === "error") {
-    drawPixelRect(x + 1, y + 12, 2, 1, "#ff86be");
-    drawPixelRect(x + 13, y + 7, 2, 1, "#ff86be");
-  }
-
-  drawMangaBadge(agent, x, y);
 }
 
 function buildSpeechLayout(
@@ -2364,10 +3667,14 @@ function drawFrame() {
     drawAgentBlock(agent, nowMs);
   }
 
+  drawBossDispatchLink(nowMs);
+
   const bubbleLayouts = resolveSpeechLayouts(nowMs, nowEpochMs);
   for (const layout of bubbleLayouts) {
     drawSpeechCloud(layout);
   }
+
+  drawBossSpeechCloud(nowEpochMs);
 
   requestAnimationFrame(drawFrame);
 }
@@ -2404,9 +3711,10 @@ setInterval(() => {
   let changed = false;
   for (const id of agentOrder) {
     const agent = agentState[id];
+    const inactivityLimitMs = inactivityLimitForAgent(agent);
     if (
       agent.status !== "idle" &&
-      now - agent.lastEventAt >= AGENT_INACTIVITY_LIMIT_MS
+      now - agent.lastEventAt >= inactivityLimitMs
     ) {
       agent.status = "idle";
       agent.phase = "waiting-input";
@@ -2431,8 +3739,9 @@ setInterval(() => {
 renderAgents();
 renderEvents();
 renderGitState(currentGitState);
-setRuntimeStatus("Wacht op input | lounge chat actief");
+setRuntimeStatus("Wacht op input | lounge rustig");
 void initializeCharacterSprites();
+void initializeRoomBackground();
 drawFrame();
 
 vscode.postMessage({ type: "webview-ready" });
@@ -2440,8 +3749,6 @@ vscode.postMessage({ type: "webview-request-snapshot" });
 
 if (import.meta.hot) {
   import.meta.hot.accept(() => {
-    if (status) {
-      status.textContent = "HMR updated";
-    }
+    renderConnectionStatus("HMR updated");
   });
 }

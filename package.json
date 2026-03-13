@@ -73,6 +73,23 @@
           "type": "boolean",
           "default": true,
           "description": "Redact common secret-like key/value pairs before export."
+        },
+        "pixelAgent.codexImport.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable live import of Codex/OpenAI coding agent telemetry from a local JSONL file."
+        },
+        "pixelAgent.codexImport.filePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to a JSONL/NDJSON file that Pixel Agent should tail for Codex telemetry events."
+        },
+        "pixelAgent.codexImport.pollMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 300,
+          "maximum": 60000,
+          "description": "Polling interval in milliseconds for checking the Codex telemetry file for new events."
         }
       }
     }

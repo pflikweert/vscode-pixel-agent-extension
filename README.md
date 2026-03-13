@@ -1,9 +1,20 @@
+
 # Pixel Copilot Agent
+
+## Nieuw in maart 2026
+
+- **Volledige Copilot Language Model integratie**: native chatflow via VS Code LM API, met modelselectie, editorcontext en streaming response.
+- **Hybride externe export**: optionele export van prompt, response en context naar een extern endpoint, configureerbaar via settings.
+- **Codex import & auto-discovery**: import van externe Codex/OpenAI agent events via JSONL-bestand of automatische detectie van lokale Codex sessies.
+- **Verbeterde panel fallback**: robuuste recovery bij devserver issues, automatische terugval op embedded/prod UI.
+- **Uitgebreide event types**: nu ook Copilot LM, Codex, export, git, terminal, tasks, diagnostics en meer.
+- **Dynamische agent scene**: command-grid met workstations, idle routines, custom sprites en statusaccenten.
+
 
 Standalone VS Code extensie in een eigen repository met:
 
 - een @pixel chat participant voor Copilot Chat
-- een Pixel Agent panel met runtime events (chat, workspace, diagnostics, taken en terminal commands)
+- een Pixel Agent panel met runtime events (chat, workspace, diagnostics, taken, terminal commands en Codex telemetry)
 - een hybride webview-flow:
   - devserver via Vite voor snelle UI-iteratie
   - production bundle in dist/webview voor packaged runs
@@ -14,17 +25,18 @@ Standalone VS Code extensie in een eigen repository met:
 - live panel met Scout, Builder en Reviewer status
 - eventlog met realtime updates uit extension host
 - echte Copilot Language Model call-flow via `vscode.lm.selectChatModels` + streaming response
-- terminal command telemetry (start/einde + exit status)
-- Endfield Command Grid scene met middenplein, workstations (Research/Engineering/QA) en rustbed
+- Codex telemetry via handmatige JSONL-import en automatische native discovery van `~/.codex` of `$CODEX_HOME`
+- terminal command telemetry (start/einde + exit status), inclusief source-detectie voor `local` en `codex`
+- vernieuwde vierkante lounge-scene met kamerachtergrond, workstations, speech bubbles en idle acties
 - fasegestuurde agentstatus in UI (`wacht op input`, `analyseert`, `antwoordt`, `bezig`, `afgerond`, `fout`)
-- dynamische character sprites uit `webview-ui/src/assets/agent-characters.jpg` (auto-detectie + grid fallback)
+- custom pixel/manga agent-rendering met statusaccenten voor working/completed/error
 - robuuste webview-start met dev/prod/embedded recovery in plaats van zwart scherm
 
 ## Projectstructuur
 
 - src/extension.ts: extension-host logica, @pixel participant, runtime events en webview loading modes
 - webview-ui/src/\*: Vite webview frontend met HMR
-- webview-ui/src/assets/\*: sprite-sheet(s) en andere frontend-assets
+- webview-ui/src/assets/\*: room background, character-sheet(s) en andere frontend-assets
 - dist/: gecompileerde extension output
 - dist/webview/: productie webview assets
 
@@ -92,6 +104,68 @@ Voorbeeld in je settings.json:
 }
 ```
 
+## Codex Import
+
+Je kunt nu ook externe Codex of OpenAI coding agent telemetry inlezen via een lokaal JSONL-bestand.
+
+Settings:
+
+- `pixelAgent.codexImport.enabled`: zet Codex import aan of uit
+- `pixelAgent.codexImport.filePath`: absoluut pad naar een JSONL of NDJSON bestand
+- `pixelAgent.codexImport.pollMs`: polling-interval voor nieuwe regels
+
+Voorbeeld in je settings.json:
+
+```json
+{
+  "pixelAgent.codexImport.enabled": true,
+  "pixelAgent.codexImport.filePath": "/absolute/path/to/codex-events.jsonl",
+  "pixelAgent.codexImport.pollMs": 1200
+}
+```
+
+Ondersteund inputformaat:
+
+- één JSON object per regel
+- of een regel met een JSON array
+- of een object met een `events` array
+
+Voorbeeld JSONL regels:
+
+```json
+{"type":"terminal.commandStarted","command":"npm test","status":"working","timestamp":"2026-03-13T12:00:00Z"}
+{"event":"tool.call","tool":"run_in_terminal","command":"git status","traceId":"abc123","model":"codex"}
+{"type":"chat.completed","summary":"Codex antwoord klaar","status":"completed","tokenUsage":{"prompt":220,"completion":94,"total":314}}
+```
+
+De imported events verschijnen in het panel met source `codex`.
+
+## Codex Auto-discovery
+
+Als Codex lokaal aanwezig is, leest de extensie ook native sessie-events automatisch in zonder extra setting.
+
+Gedrag:
+
+- zoekt eerst `CODEX_HOME`, en valt anders terug op `~/.codex`
+- pollt `session_index.jsonl` voor nieuwe of bijgewerkte sessies
+- zoekt de actieve rollout in `sessions/` of `archived_sessions/`
+- vertaalt native Codex records naar Pixel runtime events met source `codex`
+- koppelt Codex standaard aan de `Builder` agent, zodat coding-agent activiteit direct zichtbaar is in de scene
+
+Native Codex runtime events:
+
+- `codex.session`
+- `codex.session_meta`
+- `codex.userMessage`
+- `codex.response`
+- `codex.toolCall`
+- `codex.toolResult`
+- `codex.customToolCall`
+- `codex.customToolResult`
+- `codex.reasoning`
+- `codex.command`
+- `codex.complete`
+
 ## Fallback gedrag
 
 Als devserver niet bereikbaar is in development mode:
@@ -109,10 +183,11 @@ Als devserver wel bereikbaar is bij panel-start:
 ## Realtime events
 
 - @pixel chat lifecycle: ontvangen, verwerken, streaming, klaar/fout
+- Codex events: live JSONL import en automatische native sessie-discovery
 - workspace events: file change/save/create/delete/rename en actieve editor
 - diagnostics updates: errors en warnings
 - VS Code tasks: gestart/afgerond inclusief exit status
-- terminal events: terminal open/close en shell command start/einde met exit code
+- terminal events: terminal open/close en shell command start/einde met exit code en bron-tagging (`local` of `codex`)
 - git events: branch, ahead/behind, staged/unstaged/conflicts en clean/changed/conflict transitions
 
 ## Ondersteunde event types (actueel)
@@ -120,8 +195,10 @@ Als devserver wel bereikbaar is bij panel-start:
 Runtime event types (in eventLog, via `emitRuntimeEvent`):
 
 - Extension lifecycle: `extension.activated`
-- Chat lifecycle: `chat.received`, `chat.processing`, `chat.streaming`, `chat.completed`, `chat.error`
+- Chat lifecycle: `chat.received`, `chat.userPrompt`, `chat.processing`, `chat.streaming`, `chat.completed`, `chat.error`
 - Copilot LM/export: `copilot.modelSelected`, `copilot.exportSent`, `copilot.exportFailed`, `copilot.exportSkipped`
+- Codex native: `codex.session`, `codex.session_meta`, `codex.userMessage`, `codex.response`, `codex.toolCall`, `codex.toolResult`, `codex.customToolCall`, `codex.customToolResult`, `codex.reasoning`, `codex.command`, `codex.complete`
+- Codex import: `codex.importReady`, `codex.importWaiting`, `codex.importReset`, `codex.importParseError`, `codex.importFailed`
 - Workspace files: `workspace.fileChanged`, `workspace.fileSaved`, `workspace.fileCreated`, `workspace.fileDeleted`, `workspace.fileRenamed`, `workspace.activeEditorChanged`
 - Workspace typing burst: `workspace.typingBurstStarted`, `workspace.typingBurstTick`, `workspace.typingBurstIdle`
 - Diagnostics: `diagnostics.updated`
@@ -141,6 +218,7 @@ Belangrijkste velden per runtime event:
 
 - Verplicht: `type`, `timestamp`, `summary`
 - Optioneel: `detail`, `filePath`, `agentId`, `status`, `progress`, `source`, `traceId`, `spanId`, `model`, `latencyMs`, `tokenUsage`, `git`
+- `source` gebruikt op dit moment o.a. `local`, `copilot-export` en `codex`
 
 ## Git monitoring
 
@@ -151,11 +229,11 @@ Belangrijkste velden per runtime event:
 
 ## Agentgedrag in de scene
 
-- de scene is een command-grid met middenplein (idle), workstations (Research/Engineering/QA) en rustbed (max 1 slapende agent)
+- de scene is nu een vierkante lounge/command-room (`320x320`) met kamerachtergrond, workstations (Research/Engineering/QA), middenzone en rustbed
 - agents verplaatsen automatisch naar een workstation bij `working`, `completed` of `error`
 - workstation-keuze gebeurt op basis van status + fase + taaktekst (bijv. lint/test/review -> QA, build/tsc/vite -> Engineering)
-- idle agents doen korte routines (pause/dance/sleep) en idle chatter in speech bubbles met overlap-avoidance
-- character sprites worden bij opstart uit de sprite-sheet geladen; als detectie faalt, gebruikt de UI een grid fallback
+- idle agents doen korte routines (pause/dance/sleep), idle chatter in speech bubbles en extra overlays zoals telefoon of zwaaien
+- agenten worden als custom pixel/manga karakters gerenderd met visuele statusaccenten zoals speed lines, sparks en error-markers
 - na inactiviteit gaat een agent automatisch terug naar idle (`agent.idleTimeout` in extension host, en webview-reset na ~10s)
 - typing bursts op file-wijzigingen sturen extra ritmische progress-events per agent
 - bestandsnamen sturen agent-keuze mee:

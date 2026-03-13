@@ -1,4 +1,8 @@
 {
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/local/pixel-copilot-agent"
+  },
   "name": "pixel-copilot-agent",
   "displayName": "Pixel Copilot Agent",
   "description": "A starter extension with a pixel-style agent panel and Copilot Chat participant.",

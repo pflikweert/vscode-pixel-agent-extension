@@ -114,6 +114,39 @@ Voorbeeld in je settings.json:
 
 ## Codex Import
 
+
+## Lokaal installeren, updaten en verwijderen
+
+### Installeren
+
+1. Bouw het .vsix bestand:
+  ```sh
+  npx vsce package --no-dependencies --out pixel-copilot-agent.vsix
+  ```
+2. Installeer de extensie lokaal:
+  ```sh
+  code --install-extension pixel-copilot-agent.vsix
+  ```
+
+### Updaten
+
+1. Bouw een nieuwe .vsix:
+  ```sh
+  npx vsce package --no-dependencies --out pixel-copilot-agent.vsix
+  ```
+2. Installeer opnieuw (overschrijft oude versie):
+  ```sh
+  code --install-extension pixel-copilot-agent.vsix
+  ```
+
+### Verwijderen
+
+Verwijder de extensie met:
+```sh
+code --uninstall-extension pixel-copilot-agent
+```
+
+---
 Je kunt nu ook externe Codex of OpenAI coding agent telemetry inlezen via een lokaal JSONL-bestand.
 
 Settings:

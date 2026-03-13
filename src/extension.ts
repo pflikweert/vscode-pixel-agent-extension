@@ -33,6 +33,10 @@ const CODEX_SESSION_INDEX = "session_index.jsonl";
 const CODEX_SESSIONS_DIR = "sessions";
 const CODEX_ARCHIVED_DIR = "archived_sessions";
 const CODEX_AGENT_ID: AgentId = "builder";
+const ANSI_SGR_PATTERN = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-9;]*m`,
+  "g",
+);
 
 type AgentId = "scout" | "builder" | "reviewer";
 type AgentStatus = "idle" | "working" | "completed" | "error";
@@ -1771,7 +1775,35 @@ function buildCodexToolOutputDetail(output: unknown): string {
       ? parsed.output
       : output;
 
-  return normalized.replace(/\s*\n\s*/g, " | ").trim();
+  const cleaned = sanitizeCodexToolOutput(normalized);
+  return cleaned ? cleaned.replace(/\s*\n\s*/g, " | ").trim() : "Tool-output ontvangen";
+}
+
+function sanitizeCodexToolOutput(value: string): string {
+  const stripped = value
+    .replace(ANSI_SGR_PATTERN, "")
+    .replace(/\r/g, "")
+    .replace(/^\s*Chunk ID:\s*.*$/gim, "")
+    .replace(/^\s*Wall time:\s*.*$/gim, "")
+    .replace(/^\s*Process exited with code\s*.*$/gim, "")
+    .replace(/^\s*Original token count:\s*.*$/gim, "")
+    .replace(/^\s*Total output lines:\s*.*$/gim, "")
+    .replace(/^\s*Output:\s*$/gim, "")
+    .replace(/^\s*Output:\s*/gim, "")
+    .replace(/\|\s*Chunk ID:\s*[^|]+/gi, "")
+    .replace(/\|\s*Wall time:\s*[^|]+/gi, "")
+    .replace(/\|\s*Process exited with code\s*[^|]+/gi, "")
+    .replace(/\|\s*Original token count:\s*[^|]+/gi, "")
+    .replace(/\|\s*Total output lines:\s*[^|]+/gi, "")
+    .replace(/\|\s*Output:\s*/gi, " | ")
+    .trim();
+
+  return stripped
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 function parseCodexToolPayload(

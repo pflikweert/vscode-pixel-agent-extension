@@ -8,7 +8,7 @@
 - **Codex import & auto-discovery**: import van externe Codex/OpenAI agent events via JSONL-bestand of automatische detectie van lokale Codex sessies.
 - **Verbeterde panel fallback**: robuuste recovery bij devserver issues, automatische terugval op embedded/prod UI.
 - **Uitgebreide event types**: nu ook Copilot LM, Codex, export, git, terminal, tasks, diagnostics en meer.
-- **Dynamische agent scene**: command-grid met workstations, idle routines, custom sprites en statusaccenten.
+- **Dynamische agent scene**: command-room met Ops AI monitor, workstations, bureau-specifieke werkanimaties, idle-lus, plantzorg en custom sprites.
 
 
 Standalone VS Code extensie in een eigen repository met:
@@ -23,13 +23,15 @@ Standalone VS Code extensie in een eigen repository met:
 ## Wat Je Nu Krijgt
 
 - live panel met Scout, Builder en Reviewer status
+- centrale Ops AI monitor die prompts ontvangt en de gekozen agent zichtbaar dispatcht
 - eventlog met realtime updates uit extension host
 - echte Copilot Language Model call-flow via `vscode.lm.selectChatModels` + streaming response
 - Codex telemetry via handmatige JSONL-import en automatische native discovery van `~/.codex` of `$CODEX_HOME`
 - terminal command telemetry (start/einde + exit status), inclusief source-detectie voor `local` en `codex`
-- vernieuwde vierkante lounge-scene met kamerachtergrond, workstations, speech bubbles en idle acties
+- vernieuwde vierkante lounge-scene met kamerachtergrond, workstations, Ops AI monitor, speech bubbles en idle acties
 - fasegestuurde agentstatus in UI (`wacht op input`, `analyseert`, `antwoordt`, `bezig`, `afgerond`, `fout`)
-- custom pixel/manga agent-rendering met statusaccenten voor working/completed/error
+- custom pixel/manga agent-rendering met statusaccenten voor working/completed/error en werkmodi zoals thinking/typing/reviewing
+- opgeschoonde speech bubbles voor Codex tool-output, zonder terminalruis zoals chunk headers of ANSI kleurcodes
 - robuuste webview-start met dev/prod/embedded recovery in plaats van zwart scherm
 
 ## Projectstructuur
@@ -64,8 +66,10 @@ npm install
 - npm run build: bouwt extension en webview-assets
 - npm run build:extension: compileert extension host
 - npm run build:webview: buildt webview-ui naar dist/webview
-- npm run watch: TypeScript watch voor extension host
+- npm run watch: alias voor `npm run watch:extension`
+- npm run watch:extension: TypeScript watch voor extension host
 - npm run dev:webview: start Vite devserver op 127.0.0.1:5173
+- npm run lint: lint extension host en webview TypeScript bestanden
 
 ## Copilot LM Integratie
 
@@ -184,6 +188,7 @@ Als devserver wel bereikbaar is bij panel-start:
 
 - @pixel chat lifecycle: ontvangen, verwerken, streaming, klaar/fout
 - Codex events: live JSONL import en automatische native sessie-discovery
+- ops-dispatch events: prompt-routing vanuit de centrale Ops AI monitor naar de gekozen agent
 - workspace events: file change/save/create/delete/rename en actieve editor
 - diagnostics updates: errors en warnings
 - VS Code tasks: gestart/afgerond inclusief exit status
@@ -196,6 +201,7 @@ Runtime event types (in eventLog, via `emitRuntimeEvent`):
 
 - Extension lifecycle: `extension.activated`
 - Chat lifecycle: `chat.received`, `chat.userPrompt`, `chat.processing`, `chat.streaming`, `chat.completed`, `chat.error`
+- Ops orchestration: `ops.dispatch`
 - Copilot LM/export: `copilot.modelSelected`, `copilot.exportSent`, `copilot.exportFailed`, `copilot.exportSkipped`
 - Codex native: `codex.session`, `codex.session_meta`, `codex.userMessage`, `codex.response`, `codex.toolCall`, `codex.toolResult`, `codex.customToolCall`, `codex.customToolResult`, `codex.reasoning`, `codex.command`, `codex.complete`
 - Codex import: `codex.importReady`, `codex.importWaiting`, `codex.importReset`, `codex.importParseError`, `codex.importFailed`
@@ -229,12 +235,15 @@ Belangrijkste velden per runtime event:
 
 ## Agentgedrag in de scene
 
-- de scene is nu een vierkante lounge/command-room (`320x320`) met kamerachtergrond, workstations (Research/Engineering/QA), middenzone en rustbed
+- de scene is nu een vierkante lounge/command-room (`320x320`) met kamerachtergrond, workstations (Research/Engineering/QA), brede lounge-lus, rustbed, planthoek en centrale Ops AI monitor
+- de Ops AI monitor reageert op binnenkomende prompts (`chat.userPrompt`, `codex.userMessage`) en laat dispatches (`ops.dispatch`) richting de gekozen agent zien
 - agents verplaatsen automatisch naar een workstation bij `working`, `completed` of `error`
 - workstation-keuze gebeurt op basis van status + fase + taaktekst (bijv. lint/test/review -> QA, build/tsc/vite -> Engineering)
-- idle agents doen korte routines (pause/dance/sleep), idle chatter in speech bubbles en extra overlays zoals telefoon of zwaaien
+- idle agents volgen een lounge-route en doen korte routines zoals pause/dance/sleep, telefoon, zwaaien en plantzorg; het rustbed blijft bezet door maximaal 1 slapende agent tegelijk
 - agenten worden als custom pixel/manga karakters gerenderd met visuele statusaccenten zoals speed lines, sparks en error-markers
-- na inactiviteit gaat een agent automatisch terug naar idle (`agent.idleTimeout` in extension host, en webview-reset na ~10s)
+- zodra een agent bij een werkplek is aangekomen, wisselt de animatie mee met de taak (`thinking`, `typing`, `reviewing`, `completed`, `error`)
+- speech bubbles en Ops AI-dialogen strippen tooling-metadata zoals `Chunk ID`, `Wall time`, `Process exited with code` en ANSI escape-sequenties voordat tekst in de scene verschijnt
+- analyse- en reasoning-events kunnen de busy-state langer vasthouden; daarna gaat een agent automatisch terug naar idle via `agent.idleTimeout`
 - typing bursts op file-wijzigingen sturen extra ritmische progress-events per agent
 - bestandsnamen sturen agent-keuze mee:
   - docs/readme/notities -> Scout

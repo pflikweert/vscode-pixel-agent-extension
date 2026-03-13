@@ -3,6 +3,10 @@ import roomBackgroundUrl from "./assets/agent-room-bg.jpg";
 import "./styles.css";
 
 const vscode = acquireVsCodeApi();
+const ANSI_SGR_PATTERN = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-9;]*m`,
+  "g",
+);
 
 type AgentId = "scout" | "builder" | "reviewer";
 type AgentStatus = "idle" | "working" | "completed" | "error";
@@ -97,6 +101,9 @@ interface AgentVisualState extends AgentViewState {
   routine: AgentRoutine;
   routineUntilMs: number;
   nextRoutineAtMs: number;
+  nextIdleActionAtMs: number;
+  idlePreviousSpotId?: string;
+  idleHoldUntilMs: number;
   characterId: string;
   characterLabel: string;
   spriteRect?: SpriteRect;
@@ -126,6 +133,7 @@ interface IdleSpot extends Spot {
   label: string;
   jitterX: number;
   jitterY: number;
+  neighbors?: readonly string[];
 }
 
 type WorkstationRole = "research" | "engineering" | "qa";
@@ -155,6 +163,7 @@ interface WorkstationActivity {
 }
 
 type WorkstationScreenMode = "off" | "working" | "completed" | "error";
+type WorkAnimationMode = "thinking" | "typing" | "reviewing" | "completed" | "error";
 
 interface BubbleBox {
   x: number;
@@ -223,6 +232,15 @@ interface IdleJoke {
   setup: string;
   reply: string;
 }
+
+const OPS_AI_IDLE_LINES = [
+  "bzzt... lounge vector stabiel. snacks-protocol standby.",
+  "krrt... ik hoor 3 commits en 1 naderende refactor.",
+  "whirr... sector builder warm, scout-signaal nominaal.",
+  "tik-tik... idle grid danst. chaosniveau: charmant.",
+  "vrm... patchweer gedetecteerd in kwadrant engineering.",
+  "bz-bzzt... alle pixels paraat. koffie-subroutine ontbreekt.",
+];
 
 const IDLE_JOKES: IdleJoke[] = [
   {
@@ -401,7 +419,7 @@ app.innerHTML = `
       <section class="scene-shell">
         <canvas id="scene" width="320" height="320" aria-label="Pixel agent scene"></canvas>
         <div class="scene-caption">
-          <span class="pill lounge">Idle-zone: middenpad + lounge links</span>
+          <span class="pill lounge">Idle-zone: brede lounge-lus + rustbed + plantzorg</span>
           <span class="pill work">Werkstations volgen de kamerlayout: Research, Engineering en QA</span>
           <span class="pill">Rustzone bank: max 1 slapende agent</span>
         </div>
@@ -510,52 +528,107 @@ const FLOOR_BOUNDS = {
   top: roomY(44),
   bottom: roomY(160),
 };
+const BED_SPOT: IdleSpot = {
+  id: "bed",
+  label: "rustbed",
+  x: roomX(99),
+  y: roomY(145),
+  jitterX: 5,
+  jitterY: 4,
+};
+const IDLE_SPOTS: readonly IdleSpot[] = [
+  {
+    id: "center-north",
+    label: "midden boven",
+    x: roomX(160),
+    y: roomY(92),
+    jitterX: 8,
+    jitterY: 7,
+    neighbors: ["left-north", "right-north", "center-mid"],
+  },
+  {
+    id: "center-mid",
+    label: "midden corridor",
+    x: roomX(160),
+    y: roomY(116),
+    jitterX: 10,
+    jitterY: 8,
+    neighbors: ["center-north", "left-mid", "right-mid", "center-south"],
+  },
+  {
+    id: "center-south",
+    label: "zuid corridor",
+    x: roomX(160),
+    y: roomY(142),
+    jitterX: 10,
+    jitterY: 7,
+    neighbors: ["center-mid", "left-lower", "south-turn"],
+  },
+  {
+    id: "south-turn",
+    label: "zuid turn",
+    x: roomX(160),
+    y: roomY(154),
+    jitterX: 8,
+    jitterY: 5,
+    neighbors: ["center-south"],
+  },
+  {
+    id: "left-north",
+    label: "linker lus boven",
+    x: roomX(100),
+    y: roomY(95),
+    jitterX: 8,
+    jitterY: 8,
+    neighbors: ["center-north", "left-mid"],
+  },
+  {
+    id: "left-mid",
+    label: "linker lus midden",
+    x: roomX(108),
+    y: roomY(116),
+    jitterX: 10,
+    jitterY: 8,
+    neighbors: ["left-north", "center-mid", "left-lower"],
+  },
+  {
+    id: "left-lower",
+    label: "linker lounge",
+    x: roomX(115),
+    y: roomY(136),
+    jitterX: 8,
+    jitterY: 6,
+    neighbors: ["left-mid", "center-south"],
+  },
+  {
+    id: "right-north",
+    label: "rechter lus boven",
+    x: roomX(216),
+    y: roomY(96),
+    jitterX: 7,
+    jitterY: 7,
+    neighbors: ["center-north", "right-mid"],
+  },
+  {
+    id: "right-mid",
+    label: "rechter lus midden",
+    x: roomX(202),
+    y: roomY(116),
+    jitterX: 8,
+    jitterY: 7,
+    neighbors: ["right-north", "center-mid"],
+  },
+];
+const IDLE_SPOT_BY_ID = new Map(IDLE_SPOTS.map((spot) => [spot.id, spot] as const));
+const AGENT_IDLE_HOME_SPOTS: Record<AgentId, readonly string[]> = {
+  scout: ["left-north", "left-mid", "center-north"],
+  builder: ["right-north", "right-mid", "center-north"],
+  reviewer: ["center-mid", "center-south", "south-turn"],
+};
 const CHAT_SPOTS: readonly Spot[] = [
   { x: roomX(160), y: roomY(102) },
   { x: roomX(120), y: roomY(138) },
   { x: roomX(160), y: roomY(150) },
-];
-const IDLE_SPOTS: readonly IdleSpot[] = [
-  {
-    id: "center-walkway",
-    label: "middenpad",
-    x: roomX(160),
-    y: roomY(102),
-    jitterX: 10,
-    jitterY: 8,
-  },
-  {
-    id: "left-lounge-edge",
-    label: "lounge links",
-    x: roomX(120),
-    y: roomY(138),
-    jitterX: 9,
-    jitterY: 7,
-  },
-  {
-    id: "bottom-center",
-    label: "midden onder",
-    x: roomX(160),
-    y: roomY(150),
-    jitterX: 12,
-    jitterY: 5,
-  },
-  {
-    id: "left-aisle",
-    label: "linker vloer",
-    x: roomX(118),
-    y: roomY(98),
-    jitterX: 8,
-    jitterY: 10,
-  },
-  {
-    id: "right-floor",
-    label: "rechter vloer",
-    x: roomX(194),
-    y: roomY(129),
-    jitterX: 8,
-    jitterY: 7,
-  },
 ];
 const PLANT_CARE_SPOT: IdleSpot = {
   id: "plant-care",
@@ -566,7 +639,6 @@ const PLANT_CARE_SPOT: IdleSpot = {
   jitterY: 3,
 };
 const PLANT_WATER_TARGET: Spot = { x: roomX(252), y: roomY(139) };
-const BED_SPOT: Spot = { x: roomX(84), y: roomY(143) };
 const WORKSTATIONS: readonly WorkstationSpot[] = [
   {
     id: "ws-1",
@@ -608,8 +680,8 @@ const WORKSTATIONS: readonly WorkstationSpot[] = [
     id: "ws-3",
     label: "Engineering 1",
     role: "engineering",
-    x: roomX(268),
-    y: roomY(99),
+    x: roomX(246),
+    y: roomY(100),
     deskX: roomX(250),
     deskY: roomY(72),
     facing: "west",
@@ -644,8 +716,8 @@ const WORKSTATIONS: readonly WorkstationSpot[] = [
     id: "ws-5",
     label: "QA 1",
     role: "qa",
-    x: roomX(74),
-    y: roomY(102),
+    x: roomX(92),
+    y: roomY(104),
     deskX: roomX(22),
     deskY: roomY(76),
     facing: "east",
@@ -736,8 +808,10 @@ function maybeTriggerIdleOverlay(now: number) {
       agent.status === "idle" &&
       agent.routine !== "sleep" &&
       !agentIdleOverlays[id] &&
-      Math.random() < 0.045 // iets vaker events
+      now >= agent.nextIdleActionAtMs &&
+      Math.random() < 0.62
     ) {
+      agent.nextIdleActionAtMs = now + randomRange(4_200, 9_800);
       // 1 op 2 kans op een "speciale" actie (dansje, zwaaien, telefoon, slapen)
       if (Math.random() < 0.5) {
         // Trigger een idle-actie
@@ -791,11 +865,14 @@ function maybeTriggerIdleOverlay(now: number) {
           until: now + randomRange(1200, 3200),
         };
       }
+    } else if (agent.status !== "idle" && now >= agent.nextIdleActionAtMs) {
+      agent.nextIdleActionAtMs = now + randomRange(3_000, 7_000);
     }
     // Verwijder overlay als verlopen
     if (agentIdleOverlays[id] && now > agentIdleOverlays[id]!.until) {
       const expiredAction = agentIdleOverlays[id]!.action;
       agentIdleOverlays[id] = null;
+      agent.nextIdleActionAtMs = now + randomRange(3_200, 7_400);
       if (
         expiredAction === "water-plant" &&
         agent.status === "idle" &&
@@ -815,6 +892,8 @@ let currentGitState = createDefaultGitState();
 let nextIdleChatAt =
   Date.now() +
   Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
+let nextBossIdleAt =
+  Date.now() + Math.round(randomRange(10_000, 19_000));
 const bossMonitorState: BossMonitorState = {
   speechText: "",
   speechVisibleUntil: 0,
@@ -895,6 +974,9 @@ function createDefaultAgent(
     routine: "normal",
     routineUntilMs: nowMs + randomRange(1800, 3600),
     nextRoutineAtMs: nowMs + randomRange(1100, 2600),
+    nextIdleActionAtMs: nowMs + randomRange(2600, 6200),
+    idlePreviousSpotId: undefined,
+    idleHoldUntilMs: 0,
     characterId: `${id}-default`,
     characterLabel: AGENT_MANGA_TITLES[id],
     spriteRect: undefined,
@@ -906,6 +988,40 @@ function shorten(value: string, maxLength: number): string {
     return value;
   }
   return `${value.slice(0, maxLength - 1)}...`;
+}
+
+function stripSpeechNoise(value: string): string {
+  return value
+    .replace(ANSI_SGR_PATTERN, "")
+    .replace(/\r/g, "")
+    .replace(/^\s*Chunk ID:\s*.*$/gim, "")
+    .replace(/^\s*Wall time:\s*.*$/gim, "")
+    .replace(/^\s*Process exited with code\s*.*$/gim, "")
+    .replace(/^\s*Original token count:\s*.*$/gim, "")
+    .replace(/^\s*Total output lines:\s*.*$/gim, "")
+    .replace(/^\s*Output:\s*$/gim, "")
+    .replace(/^\s*Output:\s*/gim, "")
+    .replace(/\|\s*Chunk ID:\s*[^|]+/gi, "")
+    .replace(/\|\s*Wall time:\s*[^|]+/gi, "")
+    .replace(/\|\s*Process exited with code\s*[^|]+/gi, "")
+    .replace(/\|\s*Original token count:\s*[^|]+/gi, "")
+    .replace(/\|\s*Total output lines:\s*[^|]+/gi, "")
+    .replace(/\|\s*Output:\s*/gi, " | ")
+    .trim();
+}
+
+function sanitizeBubbleText(value: string): string {
+  const cleaned = stripSpeechNoise(value);
+  if (!cleaned) {
+    return "";
+  }
+
+  return cleaned
+    .split(/\n+/)
+    .map((line) => normalizeSpeechDetail(line) || normalizeSpeechSnippet(line))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -931,8 +1047,7 @@ function isBedOccupied(exceptAgentId?: AgentId): boolean {
       (agent) =>
         agent.id !== exceptAgentId &&
         agent.status === "idle" &&
-        agent.routine === "sleep" &&
-        agent.locationLabel === "rustbed",
+        agent.idleSpotId === BED_SPOT.id,
     );
 }
 
@@ -967,27 +1082,134 @@ function countIdleSpotOccupancy(spotId: string, exceptAgentId?: AgentId): number
     ).length;
 }
 
-function assignIdleTarget(agent: AgentVisualState, spot: IdleSpot) {
-  const target = randomizeIdleSpot(spot);
+function getIdleSpotById(spotId?: string): IdleSpot | undefined {
+  if (!spotId) {
+    return undefined;
+  }
+  if (spotId === BED_SPOT.id) {
+    return BED_SPOT;
+  }
+  if (spotId === PLANT_CARE_SPOT.id) {
+    return PLANT_CARE_SPOT;
+  }
+  return IDLE_SPOT_BY_ID.get(spotId);
+}
+
+function assignIdleTarget(
+  agent: AgentVisualState,
+  spot: IdleSpot,
+  options?: { rememberPrevious?: boolean; targetOverride?: Spot },
+) {
+  if (
+    options?.rememberPrevious &&
+    agent.idleSpotId &&
+    agent.idleSpotId !== spot.id
+  ) {
+    agent.idlePreviousSpotId = agent.idleSpotId;
+  }
+  const target = options?.targetOverride ?? randomizeIdleSpot(spot);
   agent.targetX = target.x;
   agent.targetY = target.y;
   agent.locationLabel = spot.label;
   agent.idleSpotId = spot.id;
   agent.lane = spot.id === PLANT_CARE_SPOT.id
-    ? IDLE_SPOTS.length
-    : Math.max(0, IDLE_SPOTS.findIndex((candidate) => candidate.id === spot.id));
+    ? IDLE_SPOTS.length + 1
+    : spot.id === BED_SPOT.id
+      ? IDLE_SPOTS.length
+      : Math.max(0, IDLE_SPOTS.findIndex((candidate) => candidate.id === spot.id));
+  agent.idleHoldUntilMs = 0;
+}
+
+function resolveIdleEntrySpot(agent: AgentVisualState): IdleSpot {
+  const preferredIds = AGENT_IDLE_HOME_SPOTS[agent.id];
+  const candidates = preferredIds
+    .map((spotId) => getIdleSpotById(spotId))
+    .filter((spot): spot is IdleSpot => Boolean(spot))
+    .map((spot, index) => {
+      const occupancyPenalty = countIdleSpotOccupancy(spot.id, agent.id) * 140;
+      const distancePenalty =
+        Math.hypot(agent.x - spot.x, agent.y - spot.y) * 0.32;
+      const anchorPenalty = index * 8;
+      return {
+        spot,
+        score:
+          occupancyPenalty + distancePenalty + anchorPenalty + randomRange(0, 8),
+      };
+    })
+    .sort((left, right) => left.score - right.score);
+
+  return candidates[0]?.spot || IDLE_SPOTS[0];
+}
+
+function resolveNextIdleSpot(agent: AgentVisualState): IdleSpot {
+  const current = getIdleSpotById(agent.idleSpotId) ?? resolveIdleEntrySpot(agent);
+  const preferredIds = new Set(AGENT_IDLE_HOME_SPOTS[agent.id]);
+  const neighborIds = current.neighbors?.length
+    ? current.neighbors
+    : AGENT_IDLE_HOME_SPOTS[agent.id];
+  const candidates = neighborIds
+    .map((spotId) => getIdleSpotById(spotId))
+    .filter((spot): spot is IdleSpot => Boolean(spot))
+    .map((spot) => {
+      const occupancyPenalty = countIdleSpotOccupancy(spot.id, agent.id) * 180;
+      const distancePenalty =
+        Math.hypot(agent.x - spot.x, agent.y - spot.y) * 0.24;
+      const backtrackPenalty =
+        agent.idlePreviousSpotId === spot.id ? 42 : 0;
+      const centerPenalty =
+        agent.id !== "reviewer" && spot.id.startsWith("center") ? 12 : 0;
+      const roleBias =
+        agent.id === "scout" && spot.id.startsWith("left")
+          ? -16
+          : agent.id === "builder" && spot.id.startsWith("right")
+            ? -16
+            : agent.id === "reviewer" &&
+                (spot.id.startsWith("center") || spot.id === "south-turn")
+              ? -14
+              : 0;
+      const homeBias = preferredIds.has(spot.id) ? -8 : 0;
+      const sameSpotPenalty = agent.idleSpotId === spot.id ? 28 : 0;
+
+      return {
+        spot,
+        score:
+          occupancyPenalty +
+          distancePenalty +
+          backtrackPenalty +
+          centerPenalty +
+          sameSpotPenalty +
+          roleBias +
+          homeBias +
+          randomRange(0, 10),
+      };
+    })
+    .sort((left, right) => left.score - right.score);
+
+  return candidates[0]?.spot || current;
 }
 
 function resolveIdleSpot(agent: AgentVisualState): IdleSpot {
-  const anchorIndex = Math.max(0, agentOrder.indexOf(agent.id));
-  const candidates = IDLE_SPOTS.map((spot, index) => {
-    const occupancyPenalty = countIdleSpotOccupancy(spot.id, agent.id) * 1000;
-    const distancePenalty = Math.hypot(agent.x - spot.x, agent.y - spot.y);
-    const anchorPenalty = Math.abs(index - anchorIndex) * 12;
-    const sameSpotBonus = agent.idleSpotId === spot.id ? -18 : 0;
+  if (!agent.idleSpotId) {
+    return resolveIdleEntrySpot(agent);
+  }
+
+  const currentSpot = getIdleSpotById(agent.idleSpotId);
+  if (
+    !currentSpot ||
+    currentSpot.id === BED_SPOT.id ||
+    currentSpot.id === PLANT_CARE_SPOT.id
+  ) {
+    return resolveIdleEntrySpot(agent);
+  }
+
+  const candidates = IDLE_SPOTS.map((spot) => {
+    const occupancyPenalty = countIdleSpotOccupancy(spot.id, agent.id) * 120;
+    const distancePenalty =
+      Math.hypot(agent.x - spot.x, agent.y - spot.y) * 0.24;
+    const sameSpotPenalty = agent.idleSpotId === spot.id ? 36 : 0;
     return {
       spot,
-      score: occupancyPenalty + distancePenalty + anchorPenalty + sameSpotBonus,
+      score: occupancyPenalty + distancePenalty + sameSpotPenalty,
     };
   }).sort((left, right) => left.score - right.score);
 
@@ -1092,14 +1314,11 @@ function applyZoneFromStatus(agent: AgentVisualState) {
     agent.idleSpotId = undefined;
     agent.workstationId = station.id;
     agent.lane = WORKSTATIONS.findIndex((value) => value.id === station.id);
+    agent.idleHoldUntilMs = 0;
   } else {
     agent.workstationId = undefined;
     if (agent.routine === "sleep" && !isBedOccupied(agent.id)) {
-      agent.targetX = BED_SPOT.x;
-      agent.targetY = BED_SPOT.y;
-      agent.locationLabel = "rustbed";
-      agent.idleSpotId = "bed";
-      agent.lane = 0;
+      assignIdleTarget(agent, BED_SPOT, { rememberPrevious: true });
     } else {
       if (agent.routine === "sleep" && isBedOccupied(agent.id)) {
         agent.routine = "pause";
@@ -1108,30 +1327,40 @@ function applyZoneFromStatus(agent: AgentVisualState) {
       const overlay = agentIdleOverlays[agent.id];
       const wantsPlantCare =
         overlay?.action === "water-plant" && !isPlantCareOccupied(agent.id);
+      const wantsBedRest =
+        !overlay?.action &&
+        agent.routine === "pause" &&
+        !isBedOccupied(agent.id) &&
+        Math.random() < 0.38;
       if (overlay?.action === "water-plant" && !wantsPlantCare) {
         agentIdleOverlays[agent.id] = null;
       }
 
       if (wantsPlantCare) {
-        assignIdleTarget(agent, PLANT_CARE_SPOT);
+        assignIdleTarget(agent, PLANT_CARE_SPOT, { rememberPrevious: true });
+      } else if (overlay?.action === "phone" || overlay?.action === "wave") {
+        agent.targetX = agent.x;
+        agent.targetY = agent.y;
+        agent.idleHoldUntilMs = 0;
+      } else if (wantsBedRest) {
+        assignIdleTarget(agent, BED_SPOT, { rememberPrevious: true });
       } else {
-        let spot = resolveIdleSpot(agent);
+        let spot =
+          agent.routine === "normal"
+            ? resolveIdleSpot(agent)
+            : resolveIdleEntrySpot(agent);
         let target = randomizeIdleSpot(spot);
         let tries = 0;
         while (isNearWorkstation(target.x, target.y) && tries < 6) {
-          spot = resolveIdleSpot(agent);
+          spot = resolveNextIdleSpot(agent);
           target = randomizeIdleSpot(spot);
           tries += 1;
         }
 
-        agent.targetX = target.x;
-        agent.targetY = target.y;
-        agent.locationLabel = spot.label;
-        agent.idleSpotId = spot.id;
-        agent.lane = Math.max(
-          0,
-          IDLE_SPOTS.findIndex((candidate) => candidate.id === spot.id),
-        );
+        assignIdleTarget(agent, spot, {
+          rememberPrevious: true,
+          targetOverride: target,
+        });
       }
     }
   }
@@ -1582,7 +1811,10 @@ function setBossSpeechText(
   mode: BossMonitorState["mode"] = "receiving",
   targetAgentId?: AgentId,
 ) {
-  const normalized = shorten(text.replace(/\s+/g, " ").trim(), 92);
+  const normalized = shorten(
+    sanitizeBubbleText(text).replace(/\s+/g, " ").trim(),
+    92,
+  );
   if (!normalized) {
     bossMonitorState.speechText = "";
     bossMonitorState.speechVisibleUntil = 0;
@@ -1602,6 +1834,7 @@ function setBossSpeechText(
   bossMonitorState.speechVisibleUntil = timestamp + visibleDuration;
   bossMonitorState.mode = mode;
   bossMonitorState.targetAgentId = targetAgentId;
+  nextBossIdleAt = timestamp + Math.round(randomRange(12_000, 24_000));
 }
 
 function isBossSpeechVisible(nowMs: number): boolean {
@@ -1669,7 +1902,16 @@ function setAgentSpeechText(
     maxMs?: number;
   },
 ) {
-  const normalized = shorten(text.replace(/\s+/g, " ").trim(), 96);
+  const normalized = shorten(
+    sanitizeBubbleText(text).replace(/\s+/g, " ").trim(),
+    96,
+  );
+  if (!normalized) {
+    agent.speechText = "";
+    agent.lastSpeechAt = 0;
+    agent.speechVisibleUntil = 0;
+    return;
+  }
   const visibleDuration = clamp(
     (timing?.baseMs ?? SPEECH_BASE_VISIBLE_MS) +
       normalized.length * (timing?.perCharMs ?? SPEECH_PER_CHAR_MS),
@@ -1688,11 +1930,11 @@ function isSpeechVisible(agent: AgentVisualState, nowMs: number): boolean {
 function chooseNextIdleRoutine(agent: AgentVisualState, nowMs: number) {
   const roll = Math.random();
   let routine: AgentRoutine = "normal";
-  if (roll >= 0.56 && roll < 0.74) {
+  if (roll >= 0.68 && roll < 0.82) {
     routine = "pause";
-  } else if (roll >= 0.74 && roll < 0.9) {
+  } else if (roll >= 0.82 && roll < 0.94) {
     routine = "dance";
-  } else if (roll >= 0.9) {
+  } else if (roll >= 0.94) {
     routine = "sleep";
   }
 
@@ -1774,6 +2016,25 @@ function maybeRunIdleChatter() {
 
   nextIdleChatAt =
     now + Math.round(randomRange(IDLE_CHAT_MIN_GAP_MS, IDLE_CHAT_MAX_GAP_MS));
+}
+
+function maybeRunBossIdleChatter() {
+  const now = Date.now();
+  if (now < nextBossIdleAt) {
+    return;
+  }
+
+  if (bossMonitorState.mode !== "idle") {
+    nextBossIdleAt = now + Math.round(randomRange(8_000, 14_000));
+    return;
+  }
+
+  if (isBossSpeechVisible(now)) {
+    nextBossIdleAt = now + Math.round(randomRange(7_000, 12_000));
+    return;
+  }
+
+  setBossSpeechText(pickRandom(OPS_AI_IDLE_LINES), now, "idle");
 }
 
 function wrapWords(line: string, maxChars: number): string[] {
@@ -1859,14 +2120,85 @@ function buildSpeechFromEvent(
     return "hmm... ik zoek het even uit";
   }
 
-  const baseSummary = event.summary
-    ? shorten(event.summary.replace(/\s+/g, " ").trim(), 74)
-    : getActiveLine(agent);
-  const detail = event.detail ? shorten(event.detail.trim(), 90) : "";
-  if (detail && detail !== baseSummary) {
-    return `${baseSummary}\n${detail}`;
+  const summary = normalizeSpeechSnippet(event.summary ?? "");
+  const detail = normalizeSpeechDetail(event.detail ?? "");
+
+  if (
+    event.type === "codex.toolCall" ||
+    event.type === "codex.customToolCall" ||
+    event.type === "codex.toolResult" ||
+    event.type === "codex.customToolResult"
+  ) {
+    const primary = detail || summary;
+    if (!primary) {
+      return "";
+    }
+    return shorten(primary, 52);
+  }
+
+  const baseSummary = summary ? shorten(summary, 42) : getActiveLine(agent);
+  const compactDetail = detail ? shorten(detail, 54) : "";
+  if (compactDetail && compactDetail !== baseSummary) {
+    return `${baseSummary}\n${compactDetail}`;
   }
   return baseSummary || getIdleLine(agent, event.timestamp || Date.now());
+}
+
+function normalizeSpeechSnippet(value: string): string {
+  let text = stripSpeechNoise(value)
+    .replace(/\[(codex|local|copilot-export)\]/gi, "")
+    .replace(/\s*\|\s*/g, " | ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  text = text
+    .replace(/^codex custom tool output\b\s*[-:|]?\s*/i, "")
+    .replace(/^codex tool output\b\s*[-:|]?\s*/i, "")
+    .replace(/^codex tool:\s*exec_command\b\s*[-:|]?\s*/i, "")
+    .replace(/^codex tool:\s*write_stdin\b\s*[-:|]?\s*/i, "")
+    .replace(/^codex custom tool:\s*apply_patch\b\s*[-:|]?\s*/i, "patch ")
+    .replace(/^codex past bestanden aan\b\s*[-:|]?\s*/i, "patch ")
+    .replace(/^codex custom tool:\s*/i, "")
+    .replace(/^codex tool:\s*/i, "")
+    .replace(/^tool-output ontvangen\b\s*[-:|]?\s*/i, "")
+    .replace(/^terminalcommando gestart\b\s*[-:|]?\s*/i, "")
+    .replace(/^\$\s*/, "")
+    .replace(/^[-:|]\s*/, "")
+    .trim();
+
+  return text;
+}
+
+function normalizeSpeechDetail(value: string): string {
+  const cleaned = normalizeSpeechSnippet(value);
+  if (!cleaned) {
+    return "";
+  }
+
+  const segments = cleaned
+    .split(" | ")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter(
+      (part) =>
+        !/^(stdout|stderr|output|trace|span|model)\s*[:=]/i.test(part) &&
+        !/^exit code\s*[:=]?\s*0$/i.test(part),
+    );
+
+  if (segments.length === 0) {
+    return cleaned;
+  }
+
+  if (segments.length === 1) {
+    return segments[0];
+  }
+
+  const pair = `${segments[0]} | ${segments[1]}`;
+  if (pair.length <= 54) {
+    return pair;
+  }
+
+  return segments[0];
 }
 
 function speechTimingForEvent(event: PixelRuntimeEvent): {
@@ -1894,9 +2226,14 @@ function speechTimingForEvent(event: PixelRuntimeEvent): {
 }
 
 function setAgentSpeech(agent: AgentVisualState, event: PixelRuntimeEvent) {
+  const speech = buildSpeechFromEvent(agent, event);
+  if (!speech) {
+    return;
+  }
+
   setAgentSpeechText(
     agent,
-    buildSpeechFromEvent(agent, event),
+    speech,
     event.timestamp || Date.now(),
     speechTimingForEvent(event),
   );
@@ -2503,6 +2840,7 @@ function drawBossHeadSprite(
   const blink = Math.sin(nowMs * 0.008) > 0.82;
   const receiving = mode === "receiving";
   const dispatching = mode === "dispatching";
+  const idle = mode === "idle";
   const mouthPulse = dispatching ? Math.sin(nowMs * 0.03) > 0 : receiving;
 
   drawPixelRect(x + 4, y + 2, 16, 12, "#1e2b40");
@@ -2525,6 +2863,17 @@ function drawBossHeadSprite(
     drawPixelRect(x + 2, y + 6, 2, 1, "#ffb9de");
     drawPixelRect(x + 20, y + 6, 2, 1, "#ffb9de");
   }
+  if (dispatching) {
+    drawPixelRect(x + 3, y + 1, 3, 1, "#a9ffd5");
+    drawPixelRect(x + 18, y + 1, 3, 1, "#a9ffd5");
+    drawPixelRect(x + 2, y + 4, 1, 4, "#dffef0");
+    drawPixelRect(x + 21, y + 4, 1, 4, "#dffef0");
+    drawPixelRect(x + 10, y + 0, 4, 1, "#e8fff3");
+  }
+  if (idle && Math.sin(nowMs * 0.01) > 0.55) {
+    drawPixelRect(x + 2, y + 5, 1, 1, "#9ae7ff");
+    drawPixelRect(x + 21, y + 5, 1, 1, "#9ae7ff");
+  }
   drawPixelRect(x + 3, y + 14, 18, 2, "rgba(104, 220, 255, 0.28)");
 }
 
@@ -2532,12 +2881,22 @@ function drawBossMonitor(nowMs: number) {
   const backgroundScene = Boolean(roomBackgroundImage);
   const rect = getBossMonitorRect(backgroundScene);
   const pulse = 0.58 + Math.sin(nowMs * 0.0048) * 0.24;
+  const burst = 0.5 + Math.sin(nowMs * 0.018) * 0.5;
   const activeAccent =
     bossMonitorState.mode === "receiving"
-      ? "rgba(255, 148, 209, 0.24)"
+      ? "rgba(255, 148, 209, 0.34)"
       : bossMonitorState.mode === "dispatching"
-        ? "rgba(145, 255, 196, 0.26)"
+        ? "rgba(145, 255, 196, 0.38)"
         : "rgba(79, 229, 255, 0.16)";
+
+  if (bossMonitorState.mode !== "idle") {
+    const halo =
+      bossMonitorState.mode === "receiving"
+        ? `rgba(255, 164, 221, ${(0.14 + burst * 0.1).toFixed(3)})`
+        : `rgba(169, 255, 213, ${(0.16 + burst * 0.12).toFixed(3)})`;
+    ctx.fillStyle = halo;
+    ctx.fillRect(rect.x - 6, rect.y - 6, rect.width + 12, rect.height + 12);
+  }
 
   ctx.fillStyle = activeAccent;
   ctx.fillRect(rect.x - 3, rect.y - 3, rect.width + 6, rect.height + 6);
@@ -2552,9 +2911,19 @@ function drawBossMonitor(nowMs: number) {
   if (bossMonitorState.mode === "receiving") {
     ctx.fillStyle = "rgba(255, 174, 221, 0.22)";
     ctx.fillRect(rect.x + 8, rect.y + 11, rect.width - 16, rect.height - 22);
+    const scanY =
+      rect.y + 12 + (Math.floor(nowMs / 90) % Math.max(3, rect.height - 24));
+    ctx.fillStyle = "rgba(255, 239, 247, 0.72)";
+    ctx.fillRect(rect.x + 8, scanY, rect.width - 16, 1);
   } else if (bossMonitorState.mode === "dispatching") {
-    ctx.fillStyle = "rgba(159, 255, 207, 0.18)";
+    ctx.fillStyle = "rgba(159, 255, 207, 0.24)";
     ctx.fillRect(rect.x + 8, rect.y + 11, rect.width - 16, rect.height - 22);
+    for (let i = 0; i < 3; i += 1) {
+      const slashX = rect.x + 10 + ((Math.floor(nowMs / 80) + i * 8) % (rect.width - 22));
+      ctx.fillStyle = "rgba(229, 255, 240, 0.66)";
+      ctx.fillRect(slashX, rect.y + 14 + i * 4, 4, 1);
+      ctx.fillRect(slashX + 1, rect.y + 15 + i * 4, 4, 1);
+    }
   }
   ctx.fillStyle = "rgba(244, 252, 255, 0.3)";
   ctx.fillRect(rect.x + 7, rect.y + 10, rect.width - 14, 2);
@@ -2566,6 +2935,8 @@ function drawBossMonitor(nowMs: number) {
       const pingOffset = Math.sin(nowMs * 0.01 + i * 0.8) > 0 ? 1 : 0;
       drawPixelRect(rect.x + 8 + i * 6, rect.y + 4 - pingOffset, 3, 1, pingColor);
     }
+    drawPixelRect(rect.x + rect.width - 12, rect.y + 4, 4, 1, pingColor);
+    drawPixelRect(rect.x + rect.width - 10, rect.y + 6, 2, 1, pingColor);
   }
 
   drawBossHeadSprite(
@@ -2605,6 +2976,7 @@ function drawBossDispatchLink(nowMs: number) {
   const endY = Math.floor(target.y - 8 + Math.sin(nowMs * 0.004 + target.bob));
 
   const pulse = Math.floor(nowMs / 90) % 3;
+  const burst = Math.sin(nowMs * 0.018) > 0;
   for (let i = 0; i <= 12; i += 1) {
     if ((i + pulse) % 3 === 0) {
       continue;
@@ -2613,6 +2985,29 @@ function drawBossDispatchLink(nowMs: number) {
     const px = Math.round(startX + (endX - startX) * progress);
     const py = Math.round(startY + (endY - startY) * progress);
     drawPixelRect(px, py, 2, 1, "#a9ffd5");
+    if (burst) {
+      drawPixelRect(px, py - 1, 1, 1, "#effff7");
+    }
+  }
+
+  for (let i = 0; i <= 7; i += 1) {
+    const progress = i / 7;
+    const px = Math.round(startX + (endX - startX) * progress);
+    const py = Math.round(startY + (endY - startY) * progress);
+    drawPixelRect(px - 1, py + 1, 1, 1, "rgba(255, 184, 228, 0.8)");
+  }
+
+  const reticleColor = burst ? "#f2fff8" : "#a9ffd5";
+  drawPixelRect(endX - 8, endY - 8, 5, 1, reticleColor);
+  drawPixelRect(endX + 3, endY - 8, 5, 1, reticleColor);
+  drawPixelRect(endX - 8, endY + 7, 5, 1, reticleColor);
+  drawPixelRect(endX + 3, endY + 7, 5, 1, reticleColor);
+  drawPixelRect(endX - 8, endY - 8, 1, 5, reticleColor);
+  drawPixelRect(endX - 8, endY + 3, 1, 5, reticleColor);
+  drawPixelRect(endX + 7, endY - 8, 1, 5, reticleColor);
+  drawPixelRect(endX + 7, endY + 3, 1, 5, reticleColor);
+  if (burst) {
+    drawPixelRect(endX - 1, endY - 1, 3, 3, "#ffffff");
   }
 }
 
@@ -2648,9 +3043,28 @@ function drawBossSpeechCloud(nowEpochMs: number) {
     canvas.height - bubbleHeight - BUBBLE_EDGE_MARGIN_PX,
   );
 
-  ctx.fillStyle = "#f7fbff";
+  const palette =
+    bossMonitorState.mode === "idle"
+      ? {
+          fill: "#e9f5ff",
+          line: "#73a9cf",
+          text: "#20364a",
+        }
+      : bossMonitorState.mode === "dispatching"
+        ? {
+            fill: "#ffe6f0",
+            line: "#e4a3bf",
+            text: "#4a2738",
+          }
+        : {
+            fill: "#fff5e9",
+            line: "#d7b184",
+            text: "#4d3720",
+          };
+
+  ctx.fillStyle = palette.fill;
   ctx.fillRect(x, y, bubbleWidth, bubbleHeight);
-  ctx.fillStyle = "#2d3850";
+  ctx.fillStyle = palette.line;
   ctx.fillRect(x, y, bubbleWidth, 1);
   ctx.fillRect(x, y + bubbleHeight - 1, bubbleWidth, 1);
   ctx.fillRect(x, y, 1, bubbleHeight);
@@ -2658,7 +3072,7 @@ function drawBossSpeechCloud(nowEpochMs: number) {
   ctx.fillRect(x - 3, y + 10, 3, 2);
   ctx.fillRect(x - 5, y + 11, 2, 1);
 
-  ctx.fillStyle = "#20283a";
+  ctx.fillStyle = palette.text;
   for (let index = 0; index < lines.length; index += 1) {
     ctx.fillText(lines[index], x + 5, y + 8 + index * 9);
   }
@@ -3148,6 +3562,78 @@ function drawPlantWateringEffect(
   drawPixelRect(PLANT_WATER_TARGET.x - 1, PLANT_WATER_TARGET.y - 1, 3, 2, leafPulse);
 }
 
+function resolveWorkAnimationMode(
+  agent: AgentVisualState,
+): WorkAnimationMode | undefined {
+  if (!isActiveStatus(agent.status) || agent.zone !== "work") {
+    return undefined;
+  }
+
+  if (agent.status === "error" || agent.phase === "error") {
+    return "error";
+  }
+  if (agent.status === "completed" || agent.phase === "done") {
+    return "completed";
+  }
+
+  const text = `${agent.task} ${agent.lastEventType}`.toLowerCase();
+  if (
+    agent.phase === "analyzing" ||
+    agent.phase === "responding" ||
+    /reason|analy|scan|read|review|prompt|chat|context|diff|status/.test(text)
+  ) {
+    return "thinking";
+  }
+  if (/lint|test|check|audit|validate|qa/.test(text)) {
+    return "reviewing";
+  }
+  return "typing";
+}
+
+function drawWorkFocusEffect(
+  agent: AgentVisualState,
+  x: number,
+  y: number,
+  nowMs: number,
+  mode: WorkAnimationMode,
+) {
+  const phasePulse = Math.sin(nowMs * 0.018 + agent.bob);
+
+  if (mode === "thinking") {
+    drawPixelRect(x + 18, y + 3, 2, 2, "#f2fbff");
+    drawPixelRect(x + 21, y + 1, 1, 1, "#9fefff");
+    drawPixelRect(x + 23, y + 4, 1, 1, "#9fefff");
+    if (phasePulse > 0) {
+      drawPixelRect(x + 20, y - 2, 2, 1, "#c7f6ff");
+      drawPixelRect(x + 23, y - 1, 1, 1, "#c7f6ff");
+    }
+    return;
+  }
+
+  if (mode === "typing") {
+    const tap = Math.sin(nowMs * 0.04 + agent.bob) > 0 ? 1 : 0;
+    drawPixelRect(x + 2, y + 23 + tap, 3, 1, "#b7f6ff");
+    drawPixelRect(x + 15, y + 23 - tap, 3, 1, "#b7f6ff");
+    drawPixelRect(x + 18, y + 16, 2, 1, "#ffe2f1");
+    return;
+  }
+
+  if (mode === "reviewing") {
+    drawPixelRect(x + 18, y + 15, 3, 1, "#fff1b7");
+    drawPixelRect(x + 19, y + 13, 1, 3, "#fff1b7");
+    return;
+  }
+
+  if (mode === "completed") {
+    drawPixelRect(x + 18, y + 6, 2, 2, "#e8fff2");
+    drawPixelRect(x + 20, y + 4, 1, 1, "#e8fff2");
+    return;
+  }
+
+  drawPixelRect(x + 18, y + 14, 3, 1, "#ff8bc0");
+  drawPixelRect(x + 19, y + 12, 1, 3, "#ff8bc0");
+}
+
 function drawSpriteCharacter(
   agent: AgentVisualState,
   x: number,
@@ -3157,30 +3643,44 @@ function drawSpriteCharacter(
   routineDance: boolean,
   routineSleep: boolean,
   routinePause: boolean,
+  settledWork: boolean,
+  workMode?: WorkAnimationMode,
 ) {
   const palette = AGENT_MANGA_PALETTES[agent.id];
   const bodyColor = resolveAgentBodyColor(agent, palette);
   const variant =
     (Math.floor(nowMs / 1500) + agent.id.length + Math.abs(agent.lane)) % 3;
+  const thinkingAtDesk = settledWork && workMode === "thinking";
+  const typingAtDesk = settledWork && workMode === "typing";
+  const reviewingAtDesk = settledWork && workMode === "reviewing";
   const eyeClosed =
     routineSleep || Math.sin(nowMs * 0.022 + agent.bob * 5.8) > 0.93;
   const danceLift = routineDance ? Math.sin(nowMs * 0.03 + agent.bob) * 3.2 : 0;
-  const torsoSway = Math.sin(nowMs * 0.009 + agent.bob) * 1.2 + danceLift * 0.35;
+  const workBob = settledWork
+    ? Math.sin(nowMs * (typingAtDesk ? 0.018 : 0.011) + agent.bob) *
+      (typingAtDesk ? 0.9 : 0.55)
+    : 0;
+  const torsoSway = settledWork
+    ? workBob
+    : Math.sin(nowMs * 0.009 + agent.bob) * 1.2 + danceLift * 0.35;
   const stride = routineSleep
     ? 0
+    : settledWork
+      ? 0
     : routineDance
       ? Math.sin(nowMs * 0.03 + agent.bob) > 0
         ? 2
         : -2
       : step * 2;
-  const actionLean = agent.status === "working" ? Math.sign(agent.vx || 1) : 0;
+  const actionLean =
+    settledWork ? 0 : agent.status === "working" ? Math.sign(agent.vx || 1) : 0;
 
   const drawX = Math.floor(x - 2 + actionLean + stride * 0.2);
   const drawY = Math.floor(y - 7 + torsoSway + (routinePause ? 1 : 0));
 
   drawPixelRect(drawX + 3, drawY + 36, 14, 2, "rgba(90, 104, 130, 0.34)");
 
-  if (agent.status === "working") {
+  if (agent.status === "working" && !settledWork) {
     drawMangaSpeedLines(
       drawX,
       drawY + 6,
@@ -3202,10 +3702,20 @@ function drawSpriteCharacter(
     );
   }
 
-  const coatWave = Math.round(Math.sin(nowMs * 0.015 + agent.bob) * 1.8);
+  const coatWave = settledWork
+    ? Math.round(Math.sin(nowMs * 0.013 + agent.bob) * 1.1)
+    : Math.round(Math.sin(nowMs * 0.015 + agent.bob) * 1.8);
   const armLift =
-    routineDance || agent.status === "working"
-      ? Math.round(Math.sin(nowMs * 0.024 + agent.bob) * 2)
+    settledWork
+      ? thinkingAtDesk
+        ? -2
+        : typingAtDesk
+          ? Math.round(Math.sin(nowMs * 0.05 + agent.bob) * 2)
+          : reviewingAtDesk
+            ? 1
+            : 0
+      : routineDance || agent.status === "working"
+        ? Math.round(Math.sin(nowMs * 0.024 + agent.bob) * 2)
       : 0;
 
   drawPixelRect(drawX + 5, drawY + 22 + stride, 3, 9, palette.outline);
@@ -3236,7 +3746,7 @@ function drawSpriteCharacter(
 
   drawPixelRect(drawX + 8, drawY + 10, 4, 2, palette.skin);
 
-  const headY = drawY + (routineSleep ? 2 : 0);
+  const headY = drawY + (routineSleep ? 2 : thinkingAtDesk ? 1 : 0);
   drawPixelRect(drawX + 4, headY + 1, 12, 12, palette.outline);
   drawPixelRect(drawX + 5, headY + 2, 10, 10, palette.skin);
   drawPixelRect(drawX + 4, headY - 2, 12, 5, palette.hair);
@@ -3311,6 +3821,10 @@ function drawSpriteCharacter(
     drawPixelRect(drawX + 15, drawY + 12, 1, 12, "rgba(255, 138, 205, 0.22)");
   }
 
+  if (settledWork && workMode) {
+    drawWorkFocusEffect(agent, drawX, drawY, nowMs, workMode);
+  }
+
   if (agent.status === "completed") {
     drawMangaSpark(drawX + 2, drawY + 4, "#e7fff3");
     drawMangaSpark(drawX + 17, drawY + 9, "#e7fff3");
@@ -3341,6 +3855,10 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
   const routineDance = agent.status === "idle" && agent.routine === "dance";
   const routineSleep = agent.status === "idle" && agent.routine === "sleep";
   const routinePause = agent.status === "idle" && agent.routine === "pause";
+  const workMode = resolveWorkAnimationMode(agent);
+  const settledWork =
+    Boolean(workMode) &&
+    Math.hypot(agent.targetX - agent.x, agent.targetY - agent.y) < 4.2;
 
   // Idle-animatie: snelheid en amplitude per agent
   const idleSpeed = AGENT_PERSONALITIES[agent.id].driftFreq;
@@ -3366,13 +3884,21 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     wateringPlant = true;
     extraWobble = Math.sin(nowMs * 0.025 + agent.bob) * 1.1;
   }
-  const wobble = Math.sin(nowMs * idleSpeed + agent.bob) * (1.5 + idleAmp * 8) + danceBoost + extraWobble;
+  const workWobble = settledWork
+    ? Math.sin(nowMs * 0.009 + agent.bob) * 0.35
+    : 0;
+  const wobble =
+    Math.sin(nowMs * idleSpeed + agent.bob) * (1.5 + idleAmp * 8) +
+    danceBoost +
+    extraWobble +
+    workWobble;
   const x = Math.floor(agent.x);
   const y = Math.floor(agent.y + wobble - 16);
   const paused = nowMs < agent.pauseUntilMs || routinePause || routineSleep;
   const cadence =
     agent.id === "builder" ? 16 : agent.id === "reviewer" ? 20 : 18;
-  let step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
+  let step =
+    paused || settledWork ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
   if (routineDance) {
     step = Math.sin(nowMs * 0.03 + agent.bob) > 0 ? 1 : -1;
   }
@@ -3386,6 +3912,8 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
     routineDance,
     routineSleep,
     routinePause,
+    settledWork,
+    workMode,
   );
 
   if (wateringPlant) {
@@ -3585,6 +4113,7 @@ function drawSpeechCloud(layout: BubbleLayout) {
 function tickAgent(agent: AgentVisualState, nowMs: number) {
   const inWorkZone = agent.zone === "work";
   const personality = AGENT_PERSONALITIES[agent.id];
+  const overlayAction = agentIdleOverlays[agent.id]?.action;
 
   if (agent.status === "idle") {
     if (nowMs >= agent.nextRoutineAtMs) {
@@ -3651,6 +4180,25 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
     }
   }
 
+  const canRoamLoop =
+    agent.status === "idle" &&
+    agent.routine === "normal" &&
+    overlayAction !== "water-plant";
+  if (canRoamLoop) {
+    if (distance < 1.6) {
+      if (agent.idleHoldUntilMs <= 0) {
+        agent.idleHoldUntilMs = nowMs + randomRange(420, 1200);
+      } else if (nowMs >= agent.idleHoldUntilMs) {
+        const nextSpot = resolveNextIdleSpot(agent);
+        assignIdleTarget(agent, nextSpot, { rememberPrevious: true });
+      }
+    } else {
+      agent.idleHoldUntilMs = 0;
+    }
+  } else {
+    agent.idleHoldUntilMs = 0;
+  }
+
   agent.x = clamp(agent.x, FLOOR_BOUNDS.left, FLOOR_BOUNDS.right);
   agent.y = clamp(agent.y, FLOOR_BOUNDS.top, FLOOR_BOUNDS.bottom);
 }
@@ -3658,6 +4206,7 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
 function drawFrame() {
   const nowMs = performance.now();
   const nowEpochMs = Date.now();
+  maybeRunBossIdleChatter();
   drawScene(nowMs);
   maybeRunIdleChatter();
 

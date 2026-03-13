@@ -8,10 +8,11 @@ const IDLE_TIMEOUT_MS = 8000;
 const DEV_SERVER_TIMEOUT_MS = 1200;
 const PANEL_READY_TIMEOUT_MS = 2500;
 const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
-const MAX_COMMAND_PREVIEW_LENGTH = 120;
+const MAX_COMMAND_PREVIEW_LENGTH = 170;
 const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = true;
 const TEST_EVENT_STEP_DELAY_MS = 420;
-const AGENT_INACTIVITY_IDLE_MS = 60000;
+const AGENT_INACTIVITY_IDLE_MS = 10000;
+const MIN_AGENT_IDLE_MS = 2200;
 const GIT_STATE_EVENT_DEBOUNCE_MS = 450;
 const TYPING_BURST_IDLE_MS = 1600;
 
@@ -172,6 +173,8 @@ let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
 const lastDocumentChangeEventAt = new Map<string, number>();
 const typingBurstStates = new Map<string, TypingBurstState>();
+const balancedAgentRotation: AgentId[] = ['scout', 'builder', 'reviewer'];
+let balancedAgentIndex = 0;
 
 export function activate(context: vscode.ExtensionContext) {
   runtimeState = createInitialRuntimeState();
@@ -376,35 +379,37 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     stopTypingBurst(document.uri.toString(), false);
 
     const filePath = normalizePath(document.uri);
+    const agentId = inferAgentForFilePath(filePath);
     emitRuntimeEvent({
       type: 'workspace.fileSaved',
       timestamp: Date.now(),
-      summary: 'Bestand opgeslagen',
+      summary: '💾 Bestand opgeslagen',
       detail: filePath,
       filePath,
-      agentId: 'builder',
+      agentId,
       status: 'completed',
       progress: 100
     });
-    scheduleAgentIdle('builder', IDLE_TIMEOUT_MS);
+    scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
   });
 
   const createListener = vscode.workspace.onDidCreateFiles((event) => {
     const now = Date.now();
     for (const uri of event.files) {
       const filePath = normalizePath(uri);
+      const agentId = inferAgentForFilePath(filePath);
       emitRuntimeEvent({
         type: 'workspace.fileCreated',
         timestamp: now,
-        summary: 'Bestand aangemaakt',
+        summary: '✨ Bestand aangemaakt',
         detail: filePath,
         filePath,
-        agentId: 'builder',
+        agentId,
         status: 'working',
         progress: 50
       });
+      scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
-    scheduleAgentIdle('builder', IDLE_TIMEOUT_MS);
   });
 
   const deleteListener = vscode.workspace.onDidDeleteFiles((event) => {
@@ -412,18 +417,19 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     for (const uri of event.files) {
       stopTypingBurst(uri.toString(), false);
       const filePath = normalizePath(uri);
+      const agentId = inferAgentForFilePath(filePath);
       emitRuntimeEvent({
         type: 'workspace.fileDeleted',
         timestamp: now,
-        summary: 'Bestand verwijderd',
+        summary: '🗑️ Bestand verwijderd',
         detail: filePath,
         filePath,
-        agentId: 'reviewer',
+        agentId,
         status: 'working',
         progress: 55
       });
+      scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
-    scheduleAgentIdle('reviewer', IDLE_TIMEOUT_MS);
   });
 
   const renameListener = vscode.workspace.onDidRenameFiles((event) => {
@@ -432,18 +438,19 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       stopTypingBurst(change.oldUri.toString(), false);
       const from = normalizePath(change.oldUri);
       const to = normalizePath(change.newUri);
+      const agentId = inferAgentForFilePath(to);
       emitRuntimeEvent({
         type: 'workspace.fileRenamed',
         timestamp: now,
-        summary: 'Bestand hernoemd',
+        summary: '🔁 Bestand hernoemd',
         detail: `${from} -> ${to}`,
         filePath: to,
-        agentId: 'scout',
+        agentId,
         status: 'working',
         progress: 45
       });
+      scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
-    scheduleAgentIdle('scout', IDLE_TIMEOUT_MS);
   });
 
   const diagnosticsListener = vscode.languages.onDidChangeDiagnostics((event) => {
@@ -468,11 +475,12 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const taskStartListener = vscode.tasks.onDidStartTaskProcess((event) => {
     const taskName = event.execution.task.name;
     const agentId = inferAgentForTask(taskName);
+    const taskType = describeTaskFriendly(taskName);
     emitRuntimeEvent({
       type: 'task.started',
       timestamp: Date.now(),
-      summary: 'Taak gestart',
-      detail: taskName,
+      summary: `⚙️ ${taskType} gestart`,
+      detail: `${taskName}\nproces gestart`,
       agentId,
       status: 'working',
       progress: 60
@@ -483,13 +491,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const taskEndListener = vscode.tasks.onDidEndTaskProcess((event) => {
     const taskName = event.execution.task.name;
     const agentId = inferAgentForTask(taskName);
+    const taskType = describeTaskFriendly(taskName);
     const code = typeof event.exitCode === 'number' ? event.exitCode : 0;
     const status: AgentStatus = code === 0 ? 'completed' : 'error';
     emitRuntimeEvent({
       type: 'task.finished',
       timestamp: Date.now(),
-      summary: code === 0 ? 'Taak succesvol afgerond' : 'Taak gefaald',
-      detail: `${taskName} (exit ${code})`,
+      summary: code === 0 ? `✅ ${taskType} afgerond` : `❌ ${taskType} gefaald`,
+      detail: `${taskName}\nexit ${code}`,
       agentId,
       status,
       progress: 100
@@ -503,43 +512,46 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     }
 
     const filePath = normalizePath(editor.document.uri);
+    const agentId = inferAgentForFilePath(filePath);
     emitRuntimeEvent({
       type: 'workspace.activeEditorChanged',
       timestamp: Date.now(),
-      summary: 'Actieve editor gewijzigd',
+      summary: '📄 Actieve editor gewijzigd',
       detail: filePath,
       filePath,
-      agentId: 'scout',
+      agentId,
       status: 'working',
       progress: 25
     });
-    scheduleAgentIdle('scout', 4500);
+    scheduleAgentIdle(agentId, 4500);
   });
 
   const terminalOpenListener = vscode.window.onDidOpenTerminal((terminal) => {
+    const agentId = nextBalancedAgent();
     emitRuntimeEvent({
       type: 'terminal.opened',
       timestamp: Date.now(),
-      summary: 'Terminal geopend',
+      summary: '🖥️ Terminal geopend',
       detail: terminal.name,
-      agentId: 'scout',
+      agentId,
       status: 'working',
       progress: 20
     });
-    scheduleAgentIdle('scout', 5000);
+    scheduleAgentIdle(agentId, 5000);
   });
 
   const terminalCloseListener = vscode.window.onDidCloseTerminal((terminal) => {
+    const agentId = nextBalancedAgent();
     emitRuntimeEvent({
       type: 'terminal.closed',
       timestamp: Date.now(),
-      summary: 'Terminal gesloten',
+      summary: '🧹 Terminal gesloten',
       detail: terminal.name,
-      agentId: 'scout',
+      agentId,
       status: 'completed',
       progress: 100
     });
-    scheduleAgentIdle('scout', 4500);
+    scheduleAgentIdle(agentId, 4500);
   });
 
   const supportsShellExecStart = typeof (vscode.window as unknown as {
@@ -555,12 +567,13 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
         const command = sanitizeCommandPreview(event.execution.commandLine.value || '');
         const terminalName = event.terminal.name || 'terminal';
         const agentId = inferAgentForCommandLine(command);
+        const friendly = buildFriendlyTerminalMessage(command, terminalName, 'started');
 
         emitRuntimeEvent({
           type: 'terminal.commandStarted',
           timestamp: Date.now(),
-          summary: 'Terminal commando gestart',
-          detail: `${terminalName}: ${command}`,
+          summary: friendly.summary,
+          detail: friendly.detail,
           agentId,
           status: 'working',
           progress: 65
@@ -576,23 +589,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
         const exitCode = event.exitCode;
 
         const status: AgentStatus = exitCode === undefined ? 'completed' : exitCode === 0 ? 'completed' : 'error';
-        const summary =
-          exitCode === undefined
-            ? 'Terminal commando afgerond'
-            : exitCode === 0
-              ? 'Terminal commando succesvol'
-              : 'Terminal commando gefaald';
-        const detail =
-          exitCode === undefined
-            ? `${terminalName}: ${command} (exit onbekend)`
-            : `${terminalName}: ${command} (exit ${exitCode})`;
+        const friendly = buildFriendlyTerminalMessage(command, terminalName, 'finished', exitCode);
 
         const agentId = inferAgentForCommandLine(command);
         emitRuntimeEvent({
           type: 'terminal.commandFinished',
           timestamp: Date.now(),
-          summary,
-          detail,
+          summary: friendly.summary,
+          detail: friendly.detail,
           agentId,
           status,
           progress: 100
@@ -1147,26 +1151,136 @@ function pickAgentForPrompt(prompt: string, command?: string): AgentId {
   return 'scout';
 }
 
+function nextBalancedAgent(): AgentId {
+  const agentId = balancedAgentRotation[balancedAgentIndex % balancedAgentRotation.length];
+  balancedAgentIndex = (balancedAgentIndex + 1) % balancedAgentRotation.length;
+  return agentId;
+}
+
+function describeTaskFriendly(taskName: string): string {
+  const lower = taskName.toLowerCase();
+  if (/lint|test|review|check|diagnostic|audit|typecheck/.test(lower)) {
+    return 'kwaliteitscheck';
+  }
+  if (/build|compile|bundle|pack|release|generate/.test(lower)) {
+    return 'build-run';
+  }
+  if (/watch|serve|dev|start/.test(lower)) {
+    return 'dev-run';
+  }
+  if (/git|status|log|diff|scan|analy/.test(lower)) {
+    return 'verkenning';
+  }
+  return 'taak';
+}
+
+function describeCommandCategory(commandLine: string): string {
+  const lower = commandLine.toLowerCase();
+
+  if (/\bgit\s+(status|log|diff|show|branch|blame)\b/.test(lower)) {
+    return 'git-onderzoek';
+  }
+  if (/\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(lower)) {
+    return 'git-werkflow';
+  }
+  if (/(npm|pnpm|yarn)\s+(install|add|remove|update)/.test(lower)) {
+    return 'dependencies';
+  }
+  if (/\b(build|compile|bundle|tsc|vite\s+build)\b/.test(lower)) {
+    return 'build';
+  }
+  if (/\b(dev|serve|start|watch|vite)\b/.test(lower)) {
+    return 'dev-server';
+  }
+  if (/\b(test|lint|eslint|vitest|jest|check|typecheck|audit)\b/.test(lower)) {
+    return 'checks';
+  }
+  if (/\b(format|prettier)\b/.test(lower)) {
+    return 'formatting';
+  }
+
+  return 'terminal';
+}
+
+function buildFriendlyTerminalMessage(
+  commandLine: string,
+  terminalName: string,
+  phase: 'started' | 'finished',
+  exitCode?: number
+): { summary: string; detail: string } {
+  const category = describeCommandCategory(commandLine);
+  const agentId = inferAgentForCommandLine(commandLine);
+  const emoji = agentId === 'builder' ? '🛠️' : agentId === 'reviewer' ? '🔎' : '🧭';
+
+  const actionLabel: Record<string, string> = {
+    'git-onderzoek': 'Git check',
+    'git-werkflow': 'Git actie',
+    dependencies: 'Dependencies',
+    build: 'Build',
+    'dev-server': 'Dev run',
+    checks: 'Checks',
+    formatting: 'Formatting',
+    terminal: 'Terminal commando'
+  };
+
+  const label = actionLabel[category] || 'Terminal commando';
+
+  if (phase === 'started') {
+    return {
+      summary: `${emoji} ${label} gestart`,
+      detail: `${terminalName} bereidt uitvoering voor\n${commandLine}`
+    };
+  }
+
+  if (typeof exitCode === 'number' && exitCode !== 0) {
+    return {
+      summary: `${emoji} ${label} mislukt`,
+      detail: `${terminalName} stopte met exit ${exitCode}\n${commandLine}`
+    };
+  }
+
+  if (typeof exitCode === 'number') {
+    return {
+      summary: `${emoji} ${label} afgerond`,
+      detail: `${terminalName} klaar met exit ${exitCode}\n${commandLine}`
+    };
+  }
+
+  return {
+    summary: `${emoji} ${label} afgerond`,
+    detail: `${terminalName} rondde af zonder exitcode\n${commandLine}`
+  };
+}
+
 function inferAgentForTask(taskName: string): AgentId {
   const lower = taskName.toLowerCase();
-  if (/lint|test|review|check|diagnostic/.test(lower)) {
+  if (/lint|test|review|check|diagnostic|audit|typecheck/.test(lower)) {
     return 'reviewer';
   }
-  if (/build|compile|bundle|fix|generate/.test(lower)) {
+  if (/build|compile|bundle|fix|generate|pack|release|dev|serve|watch|start/.test(lower)) {
     return 'builder';
   }
-  return 'scout';
+  if (/scan|analy|readme|docs?|status|log|diff/.test(lower)) {
+    return 'scout';
+  }
+  return nextBalancedAgent();
 }
 
 function inferAgentForCommandLine(commandLine: string): AgentId {
   const lower = commandLine.toLowerCase();
-  if (/lint|eslint|test|review|diagnostic|check/.test(lower)) {
+  if (/\bgit\s+(status|log|diff|show|branch|blame)\b/.test(lower)) {
+    return 'scout';
+  }
+  if (/lint|eslint|test|review|diagnostic|check|audit|typecheck/.test(lower)) {
     return 'reviewer';
   }
-  if (/build|compile|vite|npm run|pnpm|yarn|tsc|bundle/.test(lower)) {
+  if (/\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(lower)) {
     return 'builder';
   }
-  return 'scout';
+  if (/build|compile|vite|npm run|pnpm|yarn|tsc|bundle|install|dev|serve|start|watch/.test(lower)) {
+    return 'builder';
+  }
+  return nextBalancedAgent();
 }
 
 function sanitizeCommandPreview(commandLine: string): string {
@@ -1206,23 +1320,25 @@ function createAgentState(id: AgentId): AgentViewState {
   };
 }
 
-function scheduleAgentIdle(agentId: AgentId, _timeoutMs?: number) {
+function scheduleAgentIdle(agentId: AgentId, timeoutMs: number = AGENT_INACTIVITY_IDLE_MS) {
   const existing = idleTimers.get(agentId);
   if (existing) {
     clearTimeout(existing);
   }
+
+  const delayMs = Math.max(MIN_AGENT_IDLE_MS, Math.min(timeoutMs, AGENT_INACTIVITY_IDLE_MS));
 
   const timer = setTimeout(() => {
     emitRuntimeEvent({
       type: 'agent.idleTimeout',
       timestamp: Date.now(),
       summary: `${AGENT_LABELS[agentId]} terug naar idle`,
-      detail: '60s geen events ontvangen.',
+      detail: `${Math.round(delayMs / 1000)}s geen nieuwe events ontvangen.`,
       agentId,
       status: 'idle',
       progress: 0
     });
-  }, AGENT_INACTIVITY_IDLE_MS);
+  }, delayMs);
   idleTimers.set(agentId, timer);
 }
 

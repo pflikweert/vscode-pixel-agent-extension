@@ -73,6 +73,32 @@ Als devserver wel bereikbaar is bij panel-start:
 - terminal events: terminal open/close en shell command start/einde met exit code
 - git events: branch, ahead/behind, staged/unstaged/conflicts en clean/changed/conflict transitions
 
+## Ondersteunde event types (actueel)
+
+Runtime event types (in eventLog, via `emitRuntimeEvent`):
+
+- Extension lifecycle: `extension.activated`
+- Chat lifecycle: `chat.received`, `chat.processing`, `chat.streaming`, `chat.completed`, `chat.error`
+- Workspace files: `workspace.fileChanged`, `workspace.fileSaved`, `workspace.fileCreated`, `workspace.fileDeleted`, `workspace.fileRenamed`, `workspace.activeEditorChanged`
+- Workspace typing burst: `workspace.typingBurstStarted`, `workspace.typingBurstTick`, `workspace.typingBurstIdle`
+- Diagnostics: `diagnostics.updated`
+- Tasks: `task.started`, `task.finished`
+- Terminal: `terminal.opened`, `terminal.closed`, `terminal.commandStarted`, `terminal.commandFinished`
+- Git: `git.monitoringReady`, `git.unavailable`, `git.conflictsDetected`, `git.stateChanged`, `git.clean`
+- Panel lifecycle: `panel.opened`, `panel.revealed`, `panel.connected`, `panel.recovery`
+- Agent status: `agent.idleTimeout`
+- Test command events (`Pixel Agent: Emit Test Events`): `test.sequence.started`, `test.sequence.workspace`, `test.sequence.builder`, `test.sequence.reviewerWarning`, `test.sequence.reviewerResolved`, `test.sequence.finished`
+
+Webview berichttypes:
+
+- Extension -> webview: `pixel.snapshot`, `pixel.event`
+- Webview -> extension: `webview-ready`, `webview-request-snapshot`, `retry-dev-server`, `load-production`, `load-embedded`
+
+Belangrijkste velden per runtime event:
+
+- Verplicht: `type`, `timestamp`, `summary`
+- Optioneel: `detail`, `filePath`, `agentId`, `status`, `progress`, `git`
+
 ## Git monitoring
 
 - gebruikt de publieke VS Code Git API (`vscode.git`) wanneer beschikbaar

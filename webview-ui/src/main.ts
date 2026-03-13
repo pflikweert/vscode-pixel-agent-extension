@@ -57,6 +57,10 @@ interface AgentVisualState extends AgentViewState {
   lane: number;
   zone: AgentZone;
   color: string;
+  lastSpeechAt: number;
+  speechText: string;
+  pauseUntilMs: number;
+  nextPauseAtMs: number;
 }
 
 type ExtensionMessage =
@@ -68,12 +72,16 @@ if (!app) {
   throw new Error('Missing #app container.');
 }
 
-const AGENT_INACTIVITY_LIMIT_MS = 60_000;
+const AGENT_INACTIVITY_LIMIT_MS = 10_000;
+const SPEECH_VISIBLE_MS = 2_800;
+const BUBBLE_MAX_LINES = 2;
+const BUBBLE_LINE_MAX_CHARS = 34;
 const MAX_VISIBLE_EVENTS = 14;
 
 interface AgentPersonality {
   idleLines: string[];
   workFallback: string;
+  icons: string[];
   loungeSpeed: number;
   workSpeed: number;
   driftAmp: number;
@@ -92,6 +100,7 @@ const AGENT_PERSONALITIES: Record<AgentId, AgentPersonality> = {
       'nog een snelle map-check.'
     ],
     workFallback: 'context en impact checken',
+    icons: ['🙂', '🧭', '✨'],
     loungeSpeed: 0.95,
     workSpeed: 1.05,
     driftAmp: 0.14,
@@ -108,6 +117,7 @@ const AGENT_PERSONALITIES: Record<AgentId, AgentPersonality> = {
       'ready voor de volgende feature.'
     ],
     workFallback: 'implementatie uitwerken',
+    icons: ['😄', '🛠️', '🚀'],
     loungeSpeed: 1.02,
     workSpeed: 1.18,
     driftAmp: 0.09,
@@ -124,6 +134,7 @@ const AGENT_PERSONALITIES: Record<AgentId, AgentPersonality> = {
       'klaar voor een snelle review.'
     ],
     workFallback: 'validatie en checks draaien',
+    icons: ['😉', '🔎', '✅'],
     loungeSpeed: 0.88,
     workSpeed: 0.97,
     driftAmp: 0.07,
@@ -249,6 +260,7 @@ function createDefaultAgent(
   vx: number,
   bob: number
 ): AgentVisualState {
+  const nowMs = performance.now();
   return {
     id,
     label,
@@ -263,7 +275,11 @@ function createDefaultAgent(
     bob,
     lane,
     zone: 'lounge',
-    color
+    color,
+    lastSpeechAt: 0,
+    speechText: '',
+    pauseUntilMs: nowMs,
+    nextPauseAtMs: nowMs + 1200 + Math.random() * 2200
   };
 }
 
@@ -276,6 +292,10 @@ function shorten(value: string, maxLength: number): string {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function randomRange(min: number, max: number): number {
+  return min + Math.random() * (max - min);
 }
 
 function isActiveStatus(statusValue: AgentStatus): boolean {
@@ -301,26 +321,106 @@ function getIdleLine(agent: AgentVisualState, nowMs: number): string {
   const tick = Math.floor(nowMs / 4200);
   const offset = agent.id.length * 3 + agent.lane;
   const index = (tick + offset) % lines.length;
-  return lines[index];
+  const icon = pickAgentIcon(agent, nowMs);
+  return `${lines[index]} ${icon}`;
 }
 
 function getActiveLine(agent: AgentVisualState): string {
   const fallback = AGENT_PERSONALITIES[agent.id].workFallback;
   const core = shorten(agent.task || fallback, 22);
+  const icon = pickAgentIcon(agent, Date.now());
 
   if (agent.status === 'completed') {
-    return `klaar: ${core}`;
+    return `klaar: ${core} ${icon}`;
   }
   if (agent.status === 'error') {
-    return `let op: ${core}`;
+    return `let op: ${core} ${icon}`;
   }
   if (agent.id === 'scout') {
-    return `scan: ${core}`;
+    return `scan: ${core} ${icon}`;
   }
   if (agent.id === 'builder') {
-    return `bouwt: ${core}`;
+    return `bouwt: ${core} ${icon}`;
   }
-  return `checkt: ${core}`;
+  return `checkt: ${core} ${icon}`;
+}
+
+function pickAgentIcon(agent: AgentVisualState, seed: number): string {
+  const icons = AGENT_PERSONALITIES[agent.id].icons;
+  const index = Math.abs(Math.floor(seed / 850) + agent.lane + agent.id.length) % icons.length;
+  return icons[index];
+}
+
+function wrapWords(line: string, maxChars: number): string[] {
+  const words = line.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return [];
+  }
+
+  const wrapped: string[] = [];
+  let current = words[0];
+  for (let i = 1; i < words.length; i += 1) {
+    const next = `${current} ${words[i]}`;
+    if (next.length <= maxChars) {
+      current = next;
+    } else {
+      wrapped.push(current);
+      current = words[i];
+    }
+  }
+  wrapped.push(current);
+  return wrapped;
+}
+
+function wrapBubbleText(text: string, maxChars: number, maxLines: number): string[] {
+  const parts = text
+    .split('\n')
+    .map((part) => part.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const lines: string[] = [];
+  for (const part of parts) {
+    const wrapped = wrapWords(part, maxChars);
+    for (const line of wrapped) {
+      lines.push(line);
+      if (lines.length >= maxLines) {
+        break;
+      }
+    }
+    if (lines.length >= maxLines) {
+      break;
+    }
+  }
+
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const joined = parts.join(' ');
+  const rendered = lines.join(' ');
+  if (rendered.length < joined.length) {
+    const lastIndex = lines.length - 1;
+    lines[lastIndex] = shorten(lines[lastIndex], Math.max(4, maxChars - 1));
+    if (!lines[lastIndex].endsWith('...')) {
+      lines[lastIndex] = `${shorten(lines[lastIndex], Math.max(4, maxChars - 4))}...`;
+    }
+  }
+
+  return lines;
+}
+
+function buildSpeechFromEvent(agent: AgentVisualState, event: PixelRuntimeEvent): string {
+  const baseSummary = event.summary ? shorten(event.summary.replace(/\s+/g, ' ').trim(), 74) : getActiveLine(agent);
+  const detail = event.detail ? shorten(event.detail.trim(), 90) : '';
+  if (detail && detail !== baseSummary) {
+    return `${baseSummary}\n${detail}`;
+  }
+  return baseSummary || getIdleLine(agent, event.timestamp || Date.now());
+}
+
+function setAgentSpeech(agent: AgentVisualState, event: PixelRuntimeEvent) {
+  agent.speechText = buildSpeechFromEvent(agent, event);
+  agent.lastSpeechAt = event.timestamp || Date.now();
 }
 
 function renderAgents() {
@@ -359,10 +459,13 @@ function renderEvents() {
   }
 
   eventList.innerHTML = runtimeEvents
+    .slice()
+    .sort((left, right) => right.timestamp - left.timestamp)
     .slice(0, MAX_VISIBLE_EVENTS)
     .map((event) => {
       const time = new Date(event.timestamp).toLocaleTimeString();
-      const detail = event.detail ? ` - ${escapeHtml(shorten(event.detail, 82))}` : '';
+      const normalizedDetail = event.detail ? event.detail.replace(/\s*\n\s*/g, ' | ') : '';
+      const detail = normalizedDetail ? ` - ${escapeHtml(shorten(normalizedDetail, 120))}` : '';
       return `<li>[${time}] ${escapeHtml(event.summary)}${detail}</li>`;
     })
     .join('');
@@ -416,6 +519,7 @@ function updateRuntimeStatusFromAgents() {
 }
 
 function applySnapshot(snapshot: RuntimeState) {
+  const now = Date.now();
   for (const agentId of agentOrder) {
     const incoming = snapshot.agents[agentId];
     if (!incoming) {
@@ -428,6 +532,15 @@ function applySnapshot(snapshot: RuntimeState) {
       progress: incoming.progress,
       lastEventAt: incoming.lastEventAt
     };
+
+    if (now - incoming.lastEventAt <= SPEECH_VISIBLE_MS) {
+      agentState[agentId].speechText = incoming.task ? shorten(incoming.task, 88) : getActiveLine(agentState[agentId]);
+      agentState[agentId].lastSpeechAt = incoming.lastEventAt;
+    } else {
+      agentState[agentId].speechText = '';
+      agentState[agentId].lastSpeechAt = 0;
+    }
+
     applyZoneFromStatus(agentState[agentId]);
   }
 
@@ -461,6 +574,7 @@ function applyEvent(event: PixelRuntimeEvent) {
         agent.task = event.summary;
       }
       agent.lastEventAt = event.timestamp || Date.now();
+      setAgentSpeech(agent, event);
       applyZoneFromStatus(agent);
     }
   }
@@ -585,8 +699,9 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
   const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
   const x = Math.floor(agent.x);
   const y = Math.floor(agent.y + wobble);
+  const paused = nowMs < agent.pauseUntilMs;
   const cadence = agent.id === 'builder' ? 14 : agent.id === 'reviewer' ? 18 : 16;
-  const step = agent.frame % cadence < cadence / 2 ? 0 : 1;
+  const step = paused ? 0 : agent.frame % cadence < cadence / 2 ? 0 : 1;
   const palette = limbPalette(agent);
 
   ctx.fillStyle = '#2f3650';
@@ -631,19 +746,27 @@ function drawAgentBlock(agent: AgentVisualState, nowMs: number) {
 }
 
 function drawSpeechCloud(agent: AgentVisualState, nowMs: number) {
+  const now = Date.now();
+  if (!agent.speechText || now - agent.lastSpeechAt > SPEECH_VISIBLE_MS) {
+    return;
+  }
+
   const wobble = Math.sin(nowMs * 0.004 + agent.bob) * 1.5;
   const blockX = Math.floor(agent.x);
   const blockY = Math.floor(agent.y + wobble);
 
   ctx.font = '8px monospace';
-  const bubbleText = agent.status === 'idle' ? getIdleLine(agent, nowMs) : getActiveLine(agent);
-  const label = `${agent.label}: ${bubbleText}`;
-  const textWidth = Math.ceil(ctx.measureText(label).width);
-  const cloudWidth = Math.max(74, textWidth + 10);
-  const cloudHeight = 13;
+  const lines = wrapBubbleText(`${agent.label}: ${agent.speechText}`, BUBBLE_LINE_MAX_CHARS, BUBBLE_MAX_LINES);
+  if (lines.length === 0) {
+    return;
+  }
+
+  const textWidth = Math.max(...lines.map((line) => Math.ceil(ctx.measureText(line).width)));
+  const cloudWidth = Math.max(84, textWidth + 12);
+  const cloudHeight = 6 + lines.length * 9;
   const rawX = blockX + 6 - Math.floor(cloudWidth / 2);
   const cloudX = clamp(rawX, 4, canvas.width - cloudWidth - 4);
-  const cloudY = blockY - 20;
+  const cloudY = blockY - (cloudHeight + 7);
 
   ctx.fillStyle = '#f6f7ff';
   ctx.fillRect(cloudX, cloudY, cloudWidth, cloudHeight);
@@ -657,7 +780,9 @@ function drawSpeechCloud(agent: AgentVisualState, nowMs: number) {
   ctx.fillRect(blockX + 6, cloudY + cloudHeight + 2, 1, 2);
 
   ctx.fillStyle = '#1f2738';
-  ctx.fillText(label, cloudX + 5, cloudY + 9);
+  for (let index = 0; index < lines.length; index += 1) {
+    ctx.fillText(lines[index], cloudX + 5, cloudY + 8 + index * 9);
+  }
 }
 
 function tickAgent(agent: AgentVisualState, nowMs: number) {
@@ -668,12 +793,25 @@ function tickAgent(agent: AgentVisualState, nowMs: number) {
 
   agent.lane = clamp(agent.lane, 0, lanePool.length - 1);
 
+  if (nowMs >= agent.nextPauseAtMs) {
+    const busyPause = inWorkZone && agent.status === 'working';
+    const pauseDuration = busyPause ? randomRange(900, 2200) : randomRange(350, 1100);
+    agent.pauseUntilMs = nowMs + pauseDuration;
+    agent.nextPauseAtMs = agent.pauseUntilMs + (busyPause ? randomRange(1300, 3600) : randomRange(2100, 4900));
+  }
+
+  const paused = nowMs < agent.pauseUntilMs;
+
   const speedBase = inWorkZone ? 1.1 : 0.85;
   const speed = speedBase * (inWorkZone ? personality.workSpeed : personality.loungeSpeed);
-  agent.x += agent.vx * speed;
+  if (!paused) {
+    agent.x += agent.vx * speed;
+  }
   const targetY = lanePool[agent.lane];
   agent.y += (targetY - agent.y) * (inWorkZone ? 0.09 : 0.07);
-  agent.frame += 1;
+  if (!paused) {
+    agent.frame += 1;
+  }
 
   if (!inWorkZone) {
     agent.x += Math.sin(nowMs * personality.driftFreq + agent.bob) * personality.driftAmp;

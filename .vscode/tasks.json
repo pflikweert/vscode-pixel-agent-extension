@@ -3,10 +3,7 @@
   "tasks": [
     {
       "label": "dev: extension + webview",
-      "dependsOn": [
-        "npm: watch",
-        "npm: dev:webview"
-      ],
+      "dependsOn": ["npm: watch", "npm: dev:webview"],
       "dependsOrder": "parallel"
     },
     {
@@ -14,9 +11,7 @@
       "script": "watch",
       "label": "npm: watch",
       "isBackground": true,
-      "problemMatcher": [
-        "$tsc-watch"
-      ],
+      "problemMatcher": ["$tsc-watch"],
       "group": "build"
     },
     {
@@ -43,9 +38,7 @@
       "type": "npm",
       "script": "build",
       "label": "npm: build",
-      "problemMatcher": [
-        "$tsc"
-      ],
+      "problemMatcher": ["$tsc"],
       "group": "build"
     }
   ]

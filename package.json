@@ -5,14 +5,16 @@
   "version": "0.0.1",
   "publisher": "local-dev",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.99.0"
   },
+  "enabledApiProposals": [],
   "categories": [
     "Other",
     "Chat"
   ],
   "activationEvents": [
     "onStartupFinished",
+    "onLanguageModelAccess",
     "onChatParticipant:pixel-copilot-agent.pixel"
   ],
   "main": "./dist/extension.js",
@@ -41,7 +43,39 @@
           }
         ]
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Pixel Agent",
+      "properties": {
+        "pixelAgent.copilotExport.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable exporting Copilot prompt/response and editor context to an external endpoint."
+        },
+        "pixelAgent.copilotExport.endpoint": {
+          "type": "string",
+          "default": "",
+          "description": "HTTP endpoint that receives Copilot interaction payloads (POST JSON)."
+        },
+        "pixelAgent.copilotExport.timeoutMs": {
+          "type": "number",
+          "default": 4500,
+          "minimum": 500,
+          "maximum": 60000,
+          "description": "Timeout in milliseconds for exporting Copilot payloads."
+        },
+        "pixelAgent.copilotExport.includeOpenFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include a small list of open files in the export payload context."
+        },
+        "pixelAgent.copilotExport.redactSensitiveData": {
+          "type": "boolean",
+          "default": true,
+          "description": "Redact common secret-like key/value pairs before export."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "npm run build:extension && npm run build:webview",
@@ -55,7 +89,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@types/node": "^20.12.12",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "^1.99.0",
     "@typescript-eslint/eslint-plugin": "^8.57.0",
     "@typescript-eslint/parser": "^8.57.0",
     "eslint": "^9.3.0",

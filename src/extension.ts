@@ -1,13 +1,13 @@
-import * as vscode from 'vscode';
+import * as vscode from "vscode";
 
-const VIEW_TYPE = 'pixelAgent.visualizer';
+const VIEW_TYPE = "pixelAgent.visualizer";
 const MAX_EVENT_LOG = 30;
 const MAX_QUEUED_MESSAGES = 120;
 const EVENT_THROTTLE_MS = 350;
 const IDLE_TIMEOUT_MS = 8000;
 const DEV_SERVER_TIMEOUT_MS = 1200;
 const PANEL_READY_TIMEOUT_MS = 2500;
-const DEFAULT_DEV_SERVER_URL = 'http://127.0.0.1:5173';
+const DEFAULT_DEV_SERVER_URL = "http://127.0.0.1:5173";
 const MAX_COMMAND_PREVIEW_LENGTH = 170;
 const AUTO_LOAD_EMBEDDED_WHEN_DEV_CONNECTED = false;
 const TEST_EVENT_STEP_DELAY_MS = 420;
@@ -15,9 +15,14 @@ const AGENT_INACTIVITY_IDLE_MS = 10000;
 const MIN_AGENT_IDLE_MS = 2200;
 const GIT_STATE_EVENT_DEBOUNCE_MS = 450;
 const TYPING_BURST_IDLE_MS = 1600;
+const MAX_OPEN_CONTEXT_FILES = 8;
+const MAX_CONTEXT_SNIPPET_LENGTH = 120;
+const MAX_EXPORTED_RESPONSE_LENGTH = 12000;
+const EXPORT_CONFIG_ROOT = "pixelAgent.copilotExport";
+const DEFAULT_EXPORT_TIMEOUT_MS = 4500;
 
-type AgentId = 'scout' | 'builder' | 'reviewer';
-type AgentStatus = 'idle' | 'working' | 'completed' | 'error';
+type AgentId = "scout" | "builder" | "reviewer";
+type AgentStatus = "idle" | "working" | "completed" | "error";
 
 interface AgentViewState {
   id: AgentId;
@@ -37,6 +42,16 @@ interface PixelRuntimeEvent {
   agentId?: AgentId;
   status?: AgentStatus;
   progress?: number;
+  source?: "local" | "copilot-export";
+  traceId?: string;
+  spanId?: string;
+  model?: string;
+  latencyMs?: number;
+  tokenUsage?: {
+    prompt?: number;
+    completion?: number;
+    total?: number;
+  };
   git?: GitViewState;
 }
 
@@ -77,12 +92,14 @@ interface GitRepository {
 }
 
 interface GitRepositoryState {
-  HEAD: {
-    name?: string;
-    commit?: string;
-    ahead?: number;
-    behind?: number;
-  } | undefined;
+  HEAD:
+    | {
+        name?: string;
+        commit?: string;
+        ahead?: number;
+        behind?: number;
+      }
+    | undefined;
   indexChanges: GitChange[];
   workingTreeChanges: GitChange[];
   mergeChanges: GitChange[];
@@ -115,193 +132,305 @@ interface AgentBurstProfile {
   rhythm: number[];
 }
 
+interface CopilotInteractionContext {
+  workspaceSummary: string;
+  diagnosticsSummary: string;
+  activeFile?: string;
+  languageId?: string;
+  selectionPreview?: string;
+  openFiles: string[];
+}
+
+interface CopilotExportConfig {
+  enabled: boolean;
+  endpoint: string;
+  timeoutMs: number;
+  includeOpenFiles: boolean;
+  redactSensitiveData: boolean;
+}
+
+interface CopilotExportPayload {
+  source: string;
+  requestId: string;
+  timestamp: number;
+  prompt: string;
+  response: string;
+  model: string;
+  context: {
+    workspaceSummary: string;
+    diagnosticsSummary: string;
+    activeFile?: string;
+    languageId?: string;
+    selectionPreview?: string;
+    openFiles: string[];
+  };
+}
+
 type ExtensionToWebviewMessage =
-  | { type: 'pixel.snapshot'; payload: RuntimeState }
-  | { type: 'pixel.event'; payload: PixelRuntimeEvent };
+  | { type: "pixel.snapshot"; payload: RuntimeState }
+  | { type: "pixel.event"; payload: PixelRuntimeEvent };
 
 type WebviewToExtensionMessage =
-  | { type: 'webview-ready' }
-  | { type: 'webview-request-snapshot' }
-  | { type: 'retry-dev-server' }
-  | { type: 'load-production' }
-  | { type: 'load-embedded' };
+  | { type: "webview-ready" }
+  | { type: "webview-request-snapshot" }
+  | { type: "retry-dev-server" }
+  | { type: "load-production" }
+  | { type: "load-embedded" };
 
-type PanelMode = 'auto' | 'production' | 'embedded';
+type PanelMode = "auto" | "production" | "embedded";
 
 const AGENT_LABELS: Record<AgentId, string> = {
-  scout: 'Scout',
-  builder: 'Builder',
-  reviewer: 'Reviewer'
+  scout: "Scout",
+  builder: "Builder",
+  reviewer: "Reviewer",
 };
 
 const AGENT_BURST_PROFILES: Record<AgentId, AgentBurstProfile> = {
   scout: {
     heartbeatMs: 980,
-    startSummary: 'Scout verkent context',
-    tickSummaries: ['Scout leest referenties', 'Scout vergelijkt aanpakken', 'Scout markeert aandachtspunten'],
-    pauseSummary: 'Scout rondt de verkenning af',
+    startSummary: "Scout verkent context",
+    tickSummaries: [
+      "Scout leest referenties",
+      "Scout vergelijkt aanpakken",
+      "Scout markeert aandachtspunten",
+    ],
+    pauseSummary: "Scout rondt de verkenning af",
     minProgress: 26,
     maxProgress: 86,
-    rhythm: [5, 3, 6, 4, 2]
+    rhythm: [5, 3, 6, 4, 2],
   },
   builder: {
     heartbeatMs: 760,
-    startSummary: 'Builder start met coderen',
-    tickSummaries: ['Builder typt featurecode', 'Builder werkt implementatie bij', 'Builder plakt de laatste pixels'],
-    pauseSummary: 'Builder pauzeert even',
+    startSummary: "Builder start met coderen",
+    tickSummaries: [
+      "Builder typt featurecode",
+      "Builder werkt implementatie bij",
+      "Builder plakt de laatste pixels",
+    ],
+    pauseSummary: "Builder pauzeert even",
     minProgress: 34,
     maxProgress: 94,
-    rhythm: [8, 6, 7, 5, 9]
+    rhythm: [8, 6, 7, 5, 9],
   },
   reviewer: {
     heartbeatMs: 1120,
-    startSummary: 'Reviewer duikt in checks',
-    tickSummaries: ['Reviewer checkt randgevallen', 'Reviewer scherpt validaties aan', 'Reviewer fixt feedbackpunten'],
-    pauseSummary: 'Reviewer zet de checks klaar',
+    startSummary: "Reviewer duikt in checks",
+    tickSummaries: [
+      "Reviewer checkt randgevallen",
+      "Reviewer scherpt validaties aan",
+      "Reviewer fixt feedbackpunten",
+    ],
+    pauseSummary: "Reviewer zet de checks klaar",
     minProgress: 28,
     maxProgress: 90,
-    rhythm: [4, 5, 3, 6, 4]
-  }
+    rhythm: [4, 5, 3, 6, 4],
+  },
 };
 
 let panelRef: vscode.WebviewPanel | undefined;
 let panelReady = false;
 let queuedMessages: ExtensionToWebviewMessage[] = [];
-let preferredPanelMode: PanelMode = 'auto';
+let preferredPanelMode: PanelMode = "auto";
 let panelReadyWatchdog: NodeJS.Timeout | undefined;
 let runtimeState = createInitialRuntimeState();
 const idleTimers = new Map<AgentId, NodeJS.Timeout>();
 const lastDocumentChangeEventAt = new Map<string, number>();
 const typingBurstStates = new Map<string, TypingBurstState>();
-const balancedAgentRotation: AgentId[] = ['scout', 'builder', 'reviewer'];
+const balancedAgentRotation: AgentId[] = ["scout", "builder", "reviewer"];
 let balancedAgentIndex = 0;
 
 export function activate(context: vscode.ExtensionContext) {
   runtimeState = createInitialRuntimeState();
 
-  const panelCommand = vscode.commands.registerCommand('pixelAgent.openPanel', () => {
-    openPixelPanel(context);
-  });
+  const panelCommand = vscode.commands.registerCommand(
+    "pixelAgent.openPanel",
+    () => {
+      openPixelPanel(context);
+    },
+  );
 
-  const emitTestEventsCommand = vscode.commands.registerCommand('pixelAgent.emitTestEvents', () => {
-    openPixelPanel(context);
-    emitSyntheticTestEvents();
-    void vscode.window.showInformationMessage('Pixel Agent test-events verstuurd.');
-  });
+  const emitTestEventsCommand = vscode.commands.registerCommand(
+    "pixelAgent.emitTestEvents",
+    () => {
+      openPixelPanel(context);
+      emitSyntheticTestEvents();
+      void vscode.window.showInformationMessage(
+        "Pixel Agent test-events verstuurd.",
+      );
+    },
+  );
 
   context.subscriptions.push(panelCommand, emitTestEventsCommand);
 
   const participant = vscode.chat.createChatParticipant(
-    'pixel-copilot-agent.pixel',
-    async (request, _chatContext, stream) => {
+    "pixel-copilot-agent.pixel",
+    async (request, _chatContext, stream, token) => {
       const prompt = request.prompt.trim();
-      const requestLabel = request.command ? `/${request.command}` : prompt || 'lege prompt';
+      const requestLabel = request.command
+        ? `/${request.command}`
+        : prompt || "lege prompt";
       const assignedAgent = pickAgentForPrompt(prompt, request.command);
 
       emitRuntimeEvent({
-        type: 'chat.received',
+        type: "chat.received",
         timestamp: Date.now(),
-        summary: '@pixel aanvraag ontvangen',
+        summary: "@pixel aanvraag ontvangen",
         detail: requestLabel,
         agentId: assignedAgent,
-        status: 'working',
-        progress: 15
+        status: "working",
+        progress: 15,
       });
 
-      if (request.command === 'show') {
+      if (request.command === "show") {
         openPixelPanel(context);
-        stream.markdown('Pixel panel geopend.');
+        stream.markdown("Pixel panel geopend.");
         emitRuntimeEvent({
-          type: 'chat.completed',
+          type: "chat.completed",
           timestamp: Date.now(),
-          summary: '@pixel /show uitgevoerd',
-          detail: 'Panel geopend op verzoek.',
+          summary: "@pixel /show uitgevoerd",
+          detail: "Panel geopend op verzoek.",
           agentId: assignedAgent,
-          status: 'completed',
-          progress: 100
+          status: "completed",
+          progress: 100,
         });
         scheduleAgentIdle(assignedAgent, IDLE_TIMEOUT_MS);
         return;
       }
 
+      const requestId = createRequestId();
+
       try {
-        const workspaceSummary = getWorkspaceSummary();
-        const selectionPreview = getActiveSelectionPreview();
-        const diagnosticsSummary = getDiagnosticsSummary();
+        const interactionContext = getCopilotInteractionContext();
 
         emitRuntimeEvent({
-          type: 'chat.processing',
+          type: "chat.processing",
           timestamp: Date.now(),
-          summary: '@pixel antwoord opbouwen',
-          detail: 'Context uit workspace en diagnostics verzamelen.',
+          summary: "@pixel analyseert prompt en context",
+          detail: `requestId=${requestId}`,
           agentId: assignedAgent,
-          status: 'working',
-          progress: 45
+          status: "working",
+          progress: 45,
         });
 
-        stream.markdown('Ik ben je @pixel agent.\\n\\n');
-        stream.markdown(`Vraag: ${prompt || 'geen vraag meegegeven'}\\n\\n`);
+        stream.markdown("Ik ben je @pixel agent.\\n\\n");
+        stream.markdown(`Vraag: ${prompt || "geen vraag meegegeven"}\\n\\n`);
 
-        emitRuntimeEvent({
-          type: 'chat.streaming',
-          timestamp: Date.now(),
-          summary: '@pixel response stream actief',
-          detail: 'Live update naar chat en panel.',
-          agentId: assignedAgent,
-          status: 'working',
-          progress: 70
-        });
-
-        stream.markdown(`Workspace: ${workspaceSummary}\\n\\n`);
-        if (selectionPreview) {
-          stream.markdown(`Actieve selectie: ${selectionPreview}\\n\\n`);
+        const model = await selectCopilotChatModel();
+        if (!model) {
+          throw new Error(
+            "Geen beschikbaar Copilot model gevonden via vscode.lm.selectChatModels.",
+          );
         }
-        stream.markdown(`Diagnostics: ${diagnosticsSummary}\\n\\n`);
-        stream.markdown(
-          'Pixel panel draait nu op echte events uit @pixel chat, workspace wijzigingen en diagnostics. Interne built-in Copilot agent-events zijn alleen beschikbaar als de publieke API signalen blootstelt.'
+
+        const modelLabel = formatModelLabel(model);
+        emitRuntimeEvent({
+          type: "copilot.modelSelected",
+          timestamp: Date.now(),
+          summary: "Copilot model geselecteerd",
+          detail: modelLabel,
+          agentId: assignedAgent,
+          status: "working",
+          progress: 58,
+        });
+        stream.markdown(`Model: ${modelLabel}\\n\\n`);
+
+        emitRuntimeEvent({
+          type: "chat.streaming",
+          timestamp: Date.now(),
+          summary: "@pixel response stream actief",
+          detail: "Streaming output van geselecteerd Copilot model.",
+          agentId: assignedAgent,
+          status: "working",
+          progress: 70,
+        });
+
+        const responseText = await streamCopilotResponse(
+          model,
+          prompt,
+          interactionContext,
+          stream,
+          token,
+        );
+        const normalizedResponse =
+          responseText.trim() || "(geen modeloutput ontvangen)";
+        if (!responseText.trim()) {
+          stream.markdown(`${normalizedResponse}\\n\\n`);
+        }
+
+        const exportResult = await sendCopilotInteractionToExternal(
+          {
+            source: "pixel-copilot-agent",
+            requestId,
+            timestamp: Date.now(),
+            prompt,
+            response: shorten(normalizedResponse, MAX_EXPORTED_RESPONSE_LENGTH),
+            model: modelLabel,
+            context: {
+              workspaceSummary: interactionContext.workspaceSummary,
+              diagnosticsSummary: interactionContext.diagnosticsSummary,
+              activeFile: interactionContext.activeFile,
+              languageId: interactionContext.languageId,
+              selectionPreview: interactionContext.selectionPreview,
+              openFiles: interactionContext.openFiles,
+            },
+          },
+          assignedAgent,
         );
 
+        if (exportResult) {
+          emitRuntimeEvent({
+            type: "copilot.exportSent",
+            timestamp: Date.now(),
+            summary: "Copilot payload extern verzonden",
+            detail: `requestId=${requestId}`,
+            agentId: assignedAgent,
+            status: "working",
+            progress: 92,
+          });
+        }
+
         emitRuntimeEvent({
-          type: 'chat.completed',
+          type: "chat.completed",
           timestamp: Date.now(),
-          summary: '@pixel antwoord afgerond',
+          summary: "@pixel antwoord afgerond",
           detail: requestLabel,
           agentId: assignedAgent,
-          status: 'completed',
-          progress: 100
+          status: "completed",
+          progress: 100,
         });
-        scheduleAgentIdle(assignedAgent, IDLE_TIMEOUT_MS);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         emitRuntimeEvent({
-          type: 'chat.error',
+          type: "chat.error",
           timestamp: Date.now(),
-          summary: '@pixel fout tijdens afhandeling',
+          summary: "@pixel fout tijdens afhandeling",
           detail: message,
           agentId: assignedAgent,
-          status: 'error',
-          progress: 100
+          status: "error",
+          progress: 100,
         });
-        scheduleAgentIdle(assignedAgent, IDLE_TIMEOUT_MS + 2000);
         stream.markdown(`Fout tijdens verwerken: ${message}`);
+      } finally {
+        scheduleAgentIdle(assignedAgent, IDLE_TIMEOUT_MS);
       }
-    }
+    },
   );
 
-  participant.iconPath = new vscode.ThemeIcon('hubot');
+  participant.iconPath = new vscode.ThemeIcon("hubot");
   participant.followupProvider = {
     provideFollowups() {
       return [
         {
-          prompt: 'Analyseer deze map en stel een plan voor mijn volgende commit.',
-          label: 'Analyse workspace'
+          prompt:
+            "Analyseer deze map en stel een plan voor mijn volgende commit.",
+          label: "Analyse workspace",
         },
         {
-          prompt: '/show',
-          label: 'Open pixel panel'
-        }
+          prompt: "/show",
+          label: "Open pixel panel",
+        },
       ];
-    }
+    },
   };
 
   context.subscriptions.push(participant);
@@ -309,15 +438,15 @@ export function activate(context: vscode.ExtensionContext) {
   void registerGitRuntimeListeners(context);
 
   emitRuntimeEvent({
-    type: 'extension.activated',
+    type: "extension.activated",
     timestamp: Date.now(),
-    summary: 'Pixel extensie geactiveerd',
+    summary: "Pixel extensie geactiveerd",
     detail: getWorkspaceSummary(),
-    agentId: 'scout',
-    status: 'working',
-    progress: 20
+    agentId: "scout",
+    status: "working",
+    progress: 20,
   });
-  scheduleAgentIdle('scout', 4000);
+  scheduleAgentIdle("scout", 4000);
 }
 
 export function deactivate() {
@@ -339,7 +468,7 @@ export function deactivate() {
 
 function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
-    if (event.document.uri.scheme !== 'file') {
+    if (event.document.uri.scheme !== "file") {
       return;
     }
     if (event.contentChanges.length === 0) {
@@ -350,7 +479,12 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     const now = Date.now();
     const filePath = normalizePath(event.document.uri);
     const changedChars = estimateChangedCharacters(event.contentChanges);
-    const typingAgentId = startOrUpdateTypingBurst(key, filePath, changedChars, now);
+    const typingAgentId = startOrUpdateTypingBurst(
+      key,
+      filePath,
+      changedChars,
+      now,
+    );
 
     const lastAt = lastDocumentChangeEventAt.get(key) ?? 0;
     if (now - lastAt < EVENT_THROTTLE_MS) {
@@ -359,20 +493,20 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     lastDocumentChangeEventAt.set(key, now);
 
     emitRuntimeEvent({
-      type: 'workspace.fileChanged',
+      type: "workspace.fileChanged",
       timestamp: now,
-      summary: 'Bestand gewijzigd',
+      summary: "Bestand gewijzigd",
       detail: filePath,
       filePath,
       agentId: typingAgentId,
-      status: 'working',
-      progress: 35
+      status: "working",
+      progress: 35,
     });
     scheduleAgentIdle(typingAgentId, IDLE_TIMEOUT_MS);
   });
 
   const saveListener = vscode.workspace.onDidSaveTextDocument((document) => {
-    if (document.uri.scheme !== 'file') {
+    if (document.uri.scheme !== "file") {
       return;
     }
 
@@ -381,14 +515,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     const filePath = normalizePath(document.uri);
     const agentId = inferAgentForFilePath(filePath);
     emitRuntimeEvent({
-      type: 'workspace.fileSaved',
+      type: "workspace.fileSaved",
       timestamp: Date.now(),
-      summary: '💾 Bestand opgeslagen',
+      summary: "💾 Bestand opgeslagen",
       detail: filePath,
       filePath,
       agentId,
-      status: 'completed',
-      progress: 100
+      status: "completed",
+      progress: 100,
     });
     scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
   });
@@ -399,14 +533,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       const filePath = normalizePath(uri);
       const agentId = inferAgentForFilePath(filePath);
       emitRuntimeEvent({
-        type: 'workspace.fileCreated',
+        type: "workspace.fileCreated",
         timestamp: now,
-        summary: '✨ Bestand aangemaakt',
+        summary: "✨ Bestand aangemaakt",
         detail: filePath,
         filePath,
         agentId,
-        status: 'working',
-        progress: 50
+        status: "working",
+        progress: 50,
       });
       scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
@@ -419,14 +553,14 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       const filePath = normalizePath(uri);
       const agentId = inferAgentForFilePath(filePath);
       emitRuntimeEvent({
-        type: 'workspace.fileDeleted',
+        type: "workspace.fileDeleted",
         timestamp: now,
-        summary: '🗑️ Bestand verwijderd',
+        summary: "🗑️ Bestand verwijderd",
         detail: filePath,
         filePath,
         agentId,
-        status: 'working',
-        progress: 55
+        status: "working",
+        progress: 55,
       });
       scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
@@ -440,50 +574,52 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
       const to = normalizePath(change.newUri);
       const agentId = inferAgentForFilePath(to);
       emitRuntimeEvent({
-        type: 'workspace.fileRenamed',
+        type: "workspace.fileRenamed",
         timestamp: now,
-        summary: '🔁 Bestand hernoemd',
+        summary: "🔁 Bestand hernoemd",
         detail: `${from} -> ${to}`,
         filePath: to,
         agentId,
-        status: 'working',
-        progress: 45
+        status: "working",
+        progress: 45,
       });
       scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
     }
   });
 
-  const diagnosticsListener = vscode.languages.onDidChangeDiagnostics((event) => {
-    const summary = collectDiagnosticsSummary(event.uris);
-    if (summary.total === 0) {
-      return;
-    }
+  const diagnosticsListener = vscode.languages.onDidChangeDiagnostics(
+    (event) => {
+      const summary = collectDiagnosticsSummary(event.uris);
+      if (summary.total === 0) {
+        return;
+      }
 
-    const status: AgentStatus = summary.errors > 0 ? 'error' : 'completed';
-    emitRuntimeEvent({
-      type: 'diagnostics.updated',
-      timestamp: Date.now(),
-      summary: `Diagnostics ${summary.errors} errors, ${summary.warnings} warnings`,
-      detail: summary.sampleFile ?? 'workspace',
-      agentId: 'reviewer',
-      status,
-      progress: 100
-    });
-    scheduleAgentIdle('reviewer', IDLE_TIMEOUT_MS + 2000);
-  });
+      const status: AgentStatus = summary.errors > 0 ? "error" : "completed";
+      emitRuntimeEvent({
+        type: "diagnostics.updated",
+        timestamp: Date.now(),
+        summary: `Diagnostics ${summary.errors} errors, ${summary.warnings} warnings`,
+        detail: summary.sampleFile ?? "workspace",
+        agentId: "reviewer",
+        status,
+        progress: 100,
+      });
+      scheduleAgentIdle("reviewer", IDLE_TIMEOUT_MS + 2000);
+    },
+  );
 
   const taskStartListener = vscode.tasks.onDidStartTaskProcess((event) => {
     const taskName = event.execution.task.name;
     const agentId = inferAgentForTask(taskName);
     const taskType = describeTaskFriendly(taskName);
     emitRuntimeEvent({
-      type: 'task.started',
+      type: "task.started",
       timestamp: Date.now(),
       summary: `⚙️ ${taskType} gestart`,
       detail: `${taskName}\nproces gestart`,
       agentId,
-      status: 'working',
-      progress: 60
+      status: "working",
+      progress: 60,
     });
     scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 3000);
   });
@@ -492,36 +628,37 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     const taskName = event.execution.task.name;
     const agentId = inferAgentForTask(taskName);
     const taskType = describeTaskFriendly(taskName);
-    const code = typeof event.exitCode === 'number' ? event.exitCode : 0;
-    const status: AgentStatus = code === 0 ? 'completed' : 'error';
+    const code = typeof event.exitCode === "number" ? event.exitCode : 0;
+    const status: AgentStatus = code === 0 ? "completed" : "error";
     emitRuntimeEvent({
-      type: 'task.finished',
+      type: "task.finished",
       timestamp: Date.now(),
-      summary: code === 0 ? `✅ ${taskType} afgerond` : `❌ ${taskType} gefaald`,
+      summary:
+        code === 0 ? `✅ ${taskType} afgerond` : `❌ ${taskType} gefaald`,
       detail: `${taskName}\nexit ${code}`,
       agentId,
       status,
-      progress: 100
+      progress: 100,
     });
     scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 3000);
   });
 
   const editorListener = vscode.window.onDidChangeActiveTextEditor((editor) => {
-    if (!editor || editor.document.uri.scheme !== 'file') {
+    if (!editor || editor.document.uri.scheme !== "file") {
       return;
     }
 
     const filePath = normalizePath(editor.document.uri);
     const agentId = inferAgentForFilePath(filePath);
     emitRuntimeEvent({
-      type: 'workspace.activeEditorChanged',
+      type: "workspace.activeEditorChanged",
       timestamp: Date.now(),
-      summary: '📄 Actieve editor gewijzigd',
+      summary: "📄 Actieve editor gewijzigd",
       detail: filePath,
       filePath,
       agentId,
-      status: 'working',
-      progress: 25
+      status: "working",
+      progress: 25,
     });
     scheduleAgentIdle(agentId, 4500);
   });
@@ -529,13 +666,13 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const terminalOpenListener = vscode.window.onDidOpenTerminal((terminal) => {
     const agentId = nextBalancedAgent();
     emitRuntimeEvent({
-      type: 'terminal.opened',
+      type: "terminal.opened",
       timestamp: Date.now(),
-      summary: '🖥️ Terminal geopend',
+      summary: "🖥️ Terminal geopend",
       detail: terminal.name,
       agentId,
-      status: 'working',
-      progress: 20
+      status: "working",
+      progress: 20,
     });
     scheduleAgentIdle(agentId, 5000);
   });
@@ -543,40 +680,52 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
   const terminalCloseListener = vscode.window.onDidCloseTerminal((terminal) => {
     const agentId = nextBalancedAgent();
     emitRuntimeEvent({
-      type: 'terminal.closed',
+      type: "terminal.closed",
       timestamp: Date.now(),
-      summary: '🧹 Terminal gesloten',
+      summary: "🧹 Terminal gesloten",
       detail: terminal.name,
       agentId,
-      status: 'completed',
-      progress: 100
+      status: "completed",
+      progress: 100,
     });
     scheduleAgentIdle(agentId, 4500);
   });
 
-  const supportsShellExecStart = typeof (vscode.window as unknown as {
-    onDidStartTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionStartEvent>;
-  }).onDidStartTerminalShellExecution === 'function';
+  const supportsShellExecStart =
+    typeof (
+      vscode.window as unknown as {
+        onDidStartTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionStartEvent>;
+      }
+    ).onDidStartTerminalShellExecution === "function";
 
-  const supportsShellExecEnd = typeof (vscode.window as unknown as {
-    onDidEndTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionEndEvent>;
-  }).onDidEndTerminalShellExecution === 'function';
+  const supportsShellExecEnd =
+    typeof (
+      vscode.window as unknown as {
+        onDidEndTerminalShellExecution?: vscode.Event<vscode.TerminalShellExecutionEndEvent>;
+      }
+    ).onDidEndTerminalShellExecution === "function";
 
   const terminalCommandStartListener = supportsShellExecStart
     ? vscode.window.onDidStartTerminalShellExecution((event) => {
-        const command = sanitizeCommandPreview(event.execution.commandLine.value || '');
-        const terminalName = event.terminal.name || 'terminal';
+        const command = sanitizeCommandPreview(
+          event.execution.commandLine.value || "",
+        );
+        const terminalName = event.terminal.name || "terminal";
         const agentId = inferAgentForCommandLine(command);
-        const friendly = buildFriendlyTerminalMessage(command, terminalName, 'started');
+        const friendly = buildFriendlyTerminalMessage(
+          command,
+          terminalName,
+          "started",
+        );
 
         emitRuntimeEvent({
-          type: 'terminal.commandStarted',
+          type: "terminal.commandStarted",
           timestamp: Date.now(),
           summary: friendly.summary,
           detail: friendly.detail,
           agentId,
-          status: 'working',
-          progress: 65
+          status: "working",
+          progress: 65,
         });
         scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
       })
@@ -584,22 +733,34 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
 
   const terminalCommandEndListener = supportsShellExecEnd
     ? vscode.window.onDidEndTerminalShellExecution((event) => {
-        const command = sanitizeCommandPreview(event.execution.commandLine.value || '');
-        const terminalName = event.terminal.name || 'terminal';
+        const command = sanitizeCommandPreview(
+          event.execution.commandLine.value || "",
+        );
+        const terminalName = event.terminal.name || "terminal";
         const exitCode = event.exitCode;
 
-        const status: AgentStatus = exitCode === undefined ? 'completed' : exitCode === 0 ? 'completed' : 'error';
-        const friendly = buildFriendlyTerminalMessage(command, terminalName, 'finished', exitCode);
+        const status: AgentStatus =
+          exitCode === undefined
+            ? "completed"
+            : exitCode === 0
+              ? "completed"
+              : "error";
+        const friendly = buildFriendlyTerminalMessage(
+          command,
+          terminalName,
+          "finished",
+          exitCode,
+        );
 
         const agentId = inferAgentForCommandLine(command);
         emitRuntimeEvent({
-          type: 'terminal.commandFinished',
+          type: "terminal.commandFinished",
           timestamp: Date.now(),
           summary: friendly.summary,
           detail: friendly.detail,
           agentId,
           status,
-          progress: 100
+          progress: 100,
         });
         scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS + 2500);
       })
@@ -616,7 +777,7 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
     taskEndListener,
     editorListener,
     terminalOpenListener,
-    terminalCloseListener
+    terminalCloseListener,
   );
 
   if (terminalCommandStartListener) {
@@ -630,10 +791,10 @@ function registerRuntimeListeners(context: vscode.ExtensionContext) {
 function getWorkspaceSummary(): string {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
-    return 'geen geopende workspacefolder';
+    return "geen geopende workspacefolder";
   }
 
-  const names = folders.map((folder) => folder.name).join(', ');
+  const names = folders.map((folder) => folder.name).join(", ");
   return `folders: ${names}`;
 }
 
@@ -648,7 +809,7 @@ function getActiveSelectionPreview(): string | undefined {
     return undefined;
   }
 
-  return shorten(selected.replace(/\s+/g, ' '), 120);
+  return shorten(selected.replace(/\s+/g, " "), MAX_CONTEXT_SNIPPET_LENGTH);
 }
 
 function getDiagnosticsSummary(): string {
@@ -669,6 +830,250 @@ function getDiagnosticsSummary(): string {
   return `${errors} errors, ${warnings} warnings`;
 }
 
+function createRequestId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getOpenContextFiles(): string[] {
+  const deduped = new Set<string>();
+  for (const editor of vscode.window.visibleTextEditors) {
+    if (editor.document.uri.scheme !== "file") {
+      continue;
+    }
+    deduped.add(normalizePath(editor.document.uri));
+    if (deduped.size >= MAX_OPEN_CONTEXT_FILES) {
+      break;
+    }
+  }
+
+  return [...deduped];
+}
+
+function getCopilotInteractionContext(): CopilotInteractionContext {
+  const editor = vscode.window.activeTextEditor;
+  const activeFile =
+    editor && editor.document.uri.scheme === "file"
+      ? normalizePath(editor.document.uri)
+      : undefined;
+
+  return {
+    workspaceSummary: getWorkspaceSummary(),
+    diagnosticsSummary: getDiagnosticsSummary(),
+    activeFile,
+    languageId: editor?.document.languageId,
+    selectionPreview: getActiveSelectionPreview(),
+    openFiles: getOpenContextFiles(),
+  };
+}
+
+function buildCopilotPrompt(
+  prompt: string,
+  context: CopilotInteractionContext,
+): string {
+  const lines: string[] = [];
+  lines.push(
+    "Je bent @pixel, een VS Code assistent voor code- en workspacevragen.",
+  );
+  lines.push("Geef een direct, concreet antwoord in markdown.");
+  lines.push("");
+  lines.push(`Gebruikersvraag: ${prompt || "(lege vraag)"}`);
+  lines.push(`Workspace: ${context.workspaceSummary}`);
+  lines.push(`Diagnostics: ${context.diagnosticsSummary}`);
+
+  if (context.activeFile) {
+    lines.push(`Actief bestand: ${context.activeFile}`);
+  }
+  if (context.languageId) {
+    lines.push(`Taal: ${context.languageId}`);
+  }
+  if (context.selectionPreview) {
+    lines.push(`Selectie: ${context.selectionPreview}`);
+  }
+  if (context.openFiles.length > 0) {
+    lines.push(`Geopende bestanden: ${context.openFiles.join(", ")}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function selectCopilotChatModel(): Promise<
+  vscode.LanguageModelChat | undefined
+> {
+  const preferred = await vscode.lm.selectChatModels({ vendor: "copilot" });
+  if (preferred.length > 0) {
+    return preferred[0];
+  }
+
+  const fallback = await vscode.lm.selectChatModels();
+  return fallback[0];
+}
+
+function formatModelLabel(model: vscode.LanguageModelChat): string {
+  const typed = model as unknown as {
+    vendor?: string;
+    family?: string;
+    id?: string;
+    name?: string;
+  };
+  const parts = [typed.vendor, typed.family, typed.id || typed.name].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return parts.length > 0 ? parts.join("/") : "copilot-model";
+}
+
+function extractModelChunkText(chunk: unknown): string {
+  if (typeof chunk === "string") {
+    return chunk;
+  }
+  if (!chunk || typeof chunk !== "object") {
+    return "";
+  }
+
+  const typed = chunk as { value?: unknown; text?: unknown };
+  if (typeof typed.value === "string") {
+    return typed.value;
+  }
+  if (typeof typed.text === "string") {
+    return typed.text;
+  }
+
+  return "";
+}
+
+async function streamCopilotResponse(
+  model: vscode.LanguageModelChat,
+  prompt: string,
+  context: CopilotInteractionContext,
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<string> {
+  const promptWithContext = buildCopilotPrompt(prompt, context);
+  const request = await model.sendRequest(
+    [vscode.LanguageModelChatMessage.User(promptWithContext)],
+    {},
+    token,
+  );
+
+  let fullResponse = "";
+  for await (const chunk of request.text) {
+    const text = extractModelChunkText(chunk);
+    if (!text) {
+      continue;
+    }
+
+    fullResponse += text;
+    stream.markdown(text);
+  }
+
+  return fullResponse;
+}
+
+function getCopilotExportConfig(): CopilotExportConfig {
+  const config = vscode.workspace.getConfiguration(EXPORT_CONFIG_ROOT);
+  const timeoutMs = config.get<number>("timeoutMs", DEFAULT_EXPORT_TIMEOUT_MS);
+
+  return {
+    enabled: config.get<boolean>("enabled", false),
+    endpoint: (config.get<string>("endpoint", "") || "").trim(),
+    timeoutMs: Math.max(500, Math.min(60000, Math.round(timeoutMs))),
+    includeOpenFiles: config.get<boolean>("includeOpenFiles", true),
+    redactSensitiveData: config.get<boolean>("redactSensitiveData", true),
+  };
+}
+
+function redactSensitiveText(value: string): string {
+  return value.replace(
+    /(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*([^\s,;]+)/gi,
+    (_match, key: string) => `${key}=***`,
+  );
+}
+
+async function sendCopilotInteractionToExternal(
+  payload: CopilotExportPayload,
+  agentId: AgentId,
+): Promise<boolean> {
+  const exportConfig = getCopilotExportConfig();
+  if (!exportConfig.enabled) {
+    return false;
+  }
+  if (!exportConfig.endpoint) {
+    emitRuntimeEvent({
+      type: "copilot.exportSkipped",
+      timestamp: Date.now(),
+      summary: "Externe export overgeslagen",
+      detail: "pixelAgent.copilotExport.endpoint is leeg.",
+      agentId,
+      status: "working",
+      progress: 88,
+    });
+    return false;
+  }
+  if (typeof fetch !== "function") {
+    emitRuntimeEvent({
+      type: "copilot.exportSkipped",
+      timestamp: Date.now(),
+      summary: "Externe export niet beschikbaar",
+      detail: "fetch API ontbreekt in deze extension host.",
+      agentId,
+      status: "working",
+      progress: 88,
+    });
+    return false;
+  }
+
+  const body: CopilotExportPayload = {
+    ...payload,
+    prompt: exportConfig.redactSensitiveData
+      ? redactSensitiveText(payload.prompt)
+      : payload.prompt,
+    response: exportConfig.redactSensitiveData
+      ? redactSensitiveText(payload.response)
+      : payload.response,
+    context: {
+      ...payload.context,
+      selectionPreview:
+        exportConfig.redactSensitiveData && payload.context.selectionPreview
+          ? redactSensitiveText(payload.context.selectionPreview)
+          : payload.context.selectionPreview,
+      openFiles: exportConfig.includeOpenFiles ? payload.context.openFiles : [],
+    },
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), exportConfig.timeoutMs);
+
+  try {
+    const response = await fetch(exportConfig.endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    emitRuntimeEvent({
+      type: "copilot.exportFailed",
+      timestamp: Date.now(),
+      summary: "Externe export mislukt",
+      detail: message,
+      agentId,
+      status: "working",
+      progress: 88,
+    });
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function collectDiagnosticsSummary(uris: readonly vscode.Uri[]): {
   total: number;
   errors: number;
@@ -679,7 +1084,7 @@ function collectDiagnosticsSummary(uris: readonly vscode.Uri[]): {
   let warnings = 0;
 
   for (const uri of uris) {
-    if (uri.scheme !== 'file') {
+    if (uri.scheme !== "file") {
       continue;
     }
 
@@ -697,11 +1102,13 @@ function collectDiagnosticsSummary(uris: readonly vscode.Uri[]): {
     total: errors + warnings,
     errors,
     warnings,
-    sampleFile: uris.length > 0 ? normalizePath(uris[0]) : undefined
+    sampleFile: uris.length > 0 ? normalizePath(uris[0]) : undefined,
   };
 }
 
-function estimateChangedCharacters(changes: readonly vscode.TextDocumentContentChangeEvent[]): number {
+function estimateChangedCharacters(
+  changes: readonly vscode.TextDocumentContentChangeEvent[],
+): number {
   let total = 0;
   for (const change of changes) {
     total += Math.max(change.rangeLength, change.text.length);
@@ -712,12 +1119,12 @@ function estimateChangedCharacters(changes: readonly vscode.TextDocumentContentC
 function inferAgentForFilePath(filePath: string): AgentId {
   const lower = filePath.toLowerCase();
   if (/(test|spec|lint|eslint|qa|diagnostic|ci)/.test(lower)) {
-    return 'reviewer';
+    return "reviewer";
   }
   if (/(readme|docs?|\.md$|changelog|notes)/.test(lower)) {
-    return 'scout';
+    return "scout";
   }
-  return 'builder';
+  return "builder";
 }
 
 function getBurstProfile(agentId: AgentId): AgentBurstProfile {
@@ -734,7 +1141,12 @@ function nextBurstProgress(state: TypingBurstState): number {
   return Math.max(profile.minProgress, Math.min(profile.maxProgress, next));
 }
 
-function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: number, now: number): AgentId {
+function startOrUpdateTypingBurst(
+  key: string,
+  filePath: string,
+  changedChars: number,
+  now: number,
+): AgentId {
   let state = typingBurstStates.get(key);
 
   if (!state) {
@@ -748,7 +1160,7 @@ function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: n
       changes: 0,
       charsChanged: 0,
       pulseIndex: 0,
-      nextProgress: profile.minProgress
+      nextProgress: profile.minProgress,
     };
 
     state.heartbeatTimer = setInterval(() => {
@@ -763,17 +1175,20 @@ function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: n
 
       const activeProfile = getBurstProfile(active.agentId);
       active.nextProgress = nextBurstProgress(active);
-      const tickSummary = activeProfile.tickSummaries[active.pulseIndex % activeProfile.tickSummaries.length];
+      const tickSummary =
+        activeProfile.tickSummaries[
+          active.pulseIndex % activeProfile.tickSummaries.length
+        ];
 
       emitRuntimeEvent({
-        type: 'workspace.typingBurstTick',
+        type: "workspace.typingBurstTick",
         timestamp: Date.now(),
         summary: tickSummary,
         detail: `${active.filePath} | ${active.changes} edits, ${active.charsChanged} chars`,
         filePath: active.filePath,
         agentId: active.agentId,
-        status: 'working',
-        progress: active.nextProgress
+        status: "working",
+        progress: active.nextProgress,
       });
       scheduleAgentIdle(active.agentId, IDLE_TIMEOUT_MS);
     }, profile.heartbeatMs);
@@ -781,14 +1196,14 @@ function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: n
     typingBurstStates.set(key, state);
 
     emitRuntimeEvent({
-      type: 'workspace.typingBurstStarted',
+      type: "workspace.typingBurstStarted",
       timestamp: now,
       summary: profile.startSummary,
       detail: filePath,
       filePath,
       agentId,
-      status: 'working',
-      progress: state.nextProgress
+      status: "working",
+      progress: state.nextProgress,
     });
     scheduleAgentIdle(agentId, IDLE_TIMEOUT_MS);
   }
@@ -799,7 +1214,10 @@ function startOrUpdateTypingBurst(key: string, filePath: string, changedChars: n
   state.charsChanged += changedChars;
 
   if (state.changes % 5 === 0) {
-    state.nextProgress = Math.max(getBurstProfile(state.agentId).minProgress, state.nextProgress - 1);
+    state.nextProgress = Math.max(
+      getBurstProfile(state.agentId).minProgress,
+      state.nextProgress - 1,
+    );
   }
 
   scheduleTypingBurstStop(key);
@@ -843,14 +1261,14 @@ function stopTypingBurst(key: string, emitPauseEvent: boolean) {
   const profile = getBurstProfile(state.agentId);
 
   emitRuntimeEvent({
-    type: 'workspace.typingBurstIdle',
+    type: "workspace.typingBurstIdle",
     timestamp: Date.now(),
     summary: profile.pauseSummary,
     detail: `${state.filePath} | ${state.changes} edits, ${state.charsChanged} chars`,
     filePath: state.filePath,
     agentId: state.agentId,
-    status: 'completed',
-    progress: 100
+    status: "completed",
+    progress: 100,
   });
   scheduleAgentIdle(state.agentId, IDLE_TIMEOUT_MS);
 }
@@ -858,33 +1276,35 @@ function stopTypingBurst(key: string, emitPauseEvent: boolean) {
 function createDefaultGitState(): GitViewState {
   return {
     available: false,
-    branch: '-',
+    branch: "-",
     ahead: 0,
     behind: 0,
     staged: 0,
     unstaged: 0,
     conflicts: 0,
     hasChanges: false,
-    lastCommit: '-',
-    repositoryRoot: '-',
-    message: 'Git status wordt geladen.'
+    lastCommit: "-",
+    repositoryRoot: "-",
+    message: "Git status wordt geladen.",
   };
 }
 
 function createGitUnavailableState(message: string): GitViewState {
   return {
     ...createDefaultGitState(),
-    message
+    message,
   };
 }
 
-function pickPrimaryRepository(repositories: GitRepository[]): GitRepository | undefined {
+function pickPrimaryRepository(
+  repositories: GitRepository[],
+): GitRepository | undefined {
   if (repositories.length === 0) {
     return undefined;
   }
 
   const editorUri = vscode.window.activeTextEditor?.document.uri;
-  if (editorUri?.scheme === 'file') {
+  if (editorUri?.scheme === "file") {
     const editorPath = editorUri.fsPath;
     const matching = repositories
       .filter((repo) => editorPath.startsWith(repo.rootUri.fsPath))
@@ -900,26 +1320,29 @@ function pickPrimaryRepository(repositories: GitRepository[]): GitRepository | u
 function collectGitViewState(api: GitApi): GitViewState {
   const repository = pickPrimaryRepository(api.repositories);
   if (!repository) {
-    return createGitUnavailableState('Geen Git repository gevonden in deze workspace.');
+    return createGitUnavailableState(
+      "Geen Git repository gevonden in deze workspace.",
+    );
   }
 
   const head = repository.state.HEAD;
-  const branch = head?.name || '(detached)';
+  const branch = head?.name || "(detached)";
   const ahead = head?.ahead ?? 0;
   const behind = head?.behind ?? 0;
   const staged = repository.state.indexChanges.length;
   const unstaged = repository.state.workingTreeChanges.length;
   const conflicts = repository.state.mergeChanges.length;
   const hasChanges = staged + unstaged + conflicts > 0;
-  const lastCommit = head?.commit ? head.commit.slice(0, 7) : '-';
-  const repositoryRoot = normalizePath(repository.rootUri) || repository.rootUri.fsPath;
+  const lastCommit = head?.commit ? head.commit.slice(0, 7) : "-";
+  const repositoryRoot =
+    normalizePath(repository.rootUri) || repository.rootUri.fsPath;
 
   const message =
     conflicts > 0
       ? `${conflicts} conflict(en) open`
       : hasChanges
         ? `${staged} staged, ${unstaged} unstaged`
-        : 'Werkboom schoon';
+        : "Werkboom schoon";
 
   return {
     available: true,
@@ -932,7 +1355,7 @@ function collectGitViewState(api: GitApi): GitViewState {
     hasChanges,
     lastCommit,
     repositoryRoot,
-    message
+    message,
   };
 }
 
@@ -952,66 +1375,69 @@ function buildGitStateSignature(git: GitViewState): string {
     git.hasChanges,
     git.lastCommit,
     git.repositoryRoot,
-    git.message
-  ].join('|');
+    git.message,
+  ].join("|");
 }
 
 function buildGitRuntimeEvent(git: GitViewState): PixelRuntimeEvent {
   if (!git.available) {
     return {
-      type: 'git.unavailable',
+      type: "git.unavailable",
       timestamp: Date.now(),
-      summary: 'Git status niet beschikbaar',
+      summary: "Git status niet beschikbaar",
       detail: git.message,
-      agentId: 'scout',
-      status: 'completed',
+      agentId: "scout",
+      status: "completed",
       progress: 100,
-      git
+      git,
     };
   }
 
   if (git.conflicts > 0) {
     return {
-      type: 'git.conflictsDetected',
+      type: "git.conflictsDetected",
       timestamp: Date.now(),
       summary: `Git conflicts gedetecteerd (${git.conflicts})`,
       detail: `${git.branch} | ${describeGitState(git)}`,
-      agentId: 'reviewer',
-      status: 'error',
+      agentId: "reviewer",
+      status: "error",
       progress: 100,
-      git
+      git,
     };
   }
 
   if (git.hasChanges) {
     return {
-      type: 'git.stateChanged',
+      type: "git.stateChanged",
       timestamp: Date.now(),
       summary: `Git status gewijzigd op ${git.branch}`,
       detail: describeGitState(git),
-      agentId: 'builder',
-      status: 'working',
+      agentId: "builder",
+      status: "working",
       progress: 70,
-      git
+      git,
     };
   }
 
   return {
-    type: 'git.clean',
+    type: "git.clean",
     timestamp: Date.now(),
     summary: `Git werkboom schoon op ${git.branch}`,
     detail: describeGitState(git),
-    agentId: 'scout',
-    status: 'completed',
+    agentId: "scout",
+    status: "completed",
     progress: 100,
-    git
+    git,
   };
 }
 
 async function registerGitRuntimeListeners(context: vscode.ExtensionContext) {
-  const gitExtension = vscode.extensions.getExtension<GitExtensionExports>('vscode.git');
+  const gitExtension =
+    vscode.extensions.getExtension<GitExtensionExports>("vscode.git");
   if (!gitExtension) {
-    const unavailable = createGitUnavailableState('Git extension niet gevonden.');
+    const unavailable = createGitUnavailableState(
+      "Git extension niet gevonden.",
+    );
     runtimeState.git = unavailable;
     emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
     return;
@@ -1019,18 +1445,22 @@ async function registerGitRuntimeListeners(context: vscode.ExtensionContext) {
 
   let gitApi: GitApi | undefined;
   try {
-    const gitExports = gitExtension.isActive ? gitExtension.exports : await gitExtension.activate();
+    const gitExports = gitExtension.isActive
+      ? gitExtension.exports
+      : await gitExtension.activate();
     gitApi = gitExports?.getAPI(1);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const unavailable = createGitUnavailableState(`Git API kon niet starten: ${message}`);
+    const unavailable = createGitUnavailableState(
+      `Git API kon niet starten: ${message}`,
+    );
     runtimeState.git = unavailable;
     emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
     return;
   }
 
   if (!gitApi) {
-    const unavailable = createGitUnavailableState('Git API niet beschikbaar.');
+    const unavailable = createGitUnavailableState("Git API niet beschikbaar.");
     runtimeState.git = unavailable;
     emitRuntimeEvent(buildGitRuntimeEvent(unavailable));
     return;
@@ -1038,7 +1468,7 @@ async function registerGitRuntimeListeners(context: vscode.ExtensionContext) {
 
   const repoStateListeners = new Map<string, vscode.Disposable>();
   let refreshTimer: NodeJS.Timeout | undefined;
-  let lastSignature = '';
+  let lastSignature = "";
 
   const refreshGitState = (emitEvent: boolean) => {
     const nextState = collectGitViewState(gitApi);
@@ -1118,41 +1548,42 @@ async function registerGitRuntimeListeners(context: vscode.ExtensionContext) {
         listener.dispose();
       }
       repoStateListeners.clear();
-    }
+    },
   });
 
   refreshGitState(false);
 
   emitRuntimeEvent({
-    type: 'git.monitoringReady',
+    type: "git.monitoringReady",
     timestamp: Date.now(),
-    summary: 'Git monitoring actief',
+    summary: "Git monitoring actief",
     detail: `${runtimeState.git.repositoryRoot} | ${runtimeState.git.branch}`,
-    agentId: 'scout',
-    status: 'completed',
+    agentId: "scout",
+    status: "completed",
     progress: 100,
-    git: runtimeState.git
+    git: runtimeState.git,
   });
-  scheduleAgentIdle('scout', 4000);
+  scheduleAgentIdle("scout", 4000);
 }
 
 function pickAgentForPrompt(prompt: string, command?: string): AgentId {
-  if (command === 'show') {
-    return 'scout';
+  if (command === "show") {
+    return "scout";
   }
 
   const text = prompt.toLowerCase();
   if (/review|lint|test|error|bug|diagnostic/.test(text)) {
-    return 'reviewer';
+    return "reviewer";
   }
   if (/build|schrijf|write|fix|implement|code/.test(text)) {
-    return 'builder';
+    return "builder";
   }
-  return 'scout';
+  return "scout";
 }
 
 function nextBalancedAgent(): AgentId {
-  const agentId = balancedAgentRotation[balancedAgentIndex % balancedAgentRotation.length];
+  const agentId =
+    balancedAgentRotation[balancedAgentIndex % balancedAgentRotation.length];
   balancedAgentIndex = (balancedAgentIndex + 1) % balancedAgentRotation.length;
   return agentId;
 }
@@ -1160,108 +1591,117 @@ function nextBalancedAgent(): AgentId {
 function describeTaskFriendly(taskName: string): string {
   const lower = taskName.toLowerCase();
   if (/lint|test|review|check|diagnostic|audit|typecheck/.test(lower)) {
-    return 'kwaliteitscheck';
+    return "kwaliteitscheck";
   }
   if (/build|compile|bundle|pack|release|generate/.test(lower)) {
-    return 'build-run';
+    return "build-run";
   }
   if (/watch|serve|dev|start/.test(lower)) {
-    return 'dev-run';
+    return "dev-run";
   }
   if (/git|status|log|diff|scan|analy/.test(lower)) {
-    return 'verkenning';
+    return "verkenning";
   }
-  return 'taak';
+  return "taak";
 }
 
 function describeCommandCategory(commandLine: string): string {
   const lower = commandLine.toLowerCase();
 
   if (/\bgit\s+(status|log|diff|show|branch|blame)\b/.test(lower)) {
-    return 'git-onderzoek';
+    return "git-onderzoek";
   }
-  if (/\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(lower)) {
-    return 'git-werkflow';
+  if (
+    /\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(
+      lower,
+    )
+  ) {
+    return "git-werkflow";
   }
   if (/(npm|pnpm|yarn)\s+(install|add|remove|update)/.test(lower)) {
-    return 'dependencies';
+    return "dependencies";
   }
   if (/\b(build|compile|bundle|tsc|vite\s+build)\b/.test(lower)) {
-    return 'build';
+    return "build";
   }
   if (/\b(dev|serve|start|watch|vite)\b/.test(lower)) {
-    return 'dev-server';
+    return "dev-server";
   }
   if (/\b(test|lint|eslint|vitest|jest|check|typecheck|audit)\b/.test(lower)) {
-    return 'checks';
+    return "checks";
   }
   if (/\b(format|prettier)\b/.test(lower)) {
-    return 'formatting';
+    return "formatting";
   }
 
-  return 'terminal';
+  return "terminal";
 }
 
 function buildFriendlyTerminalMessage(
   commandLine: string,
   terminalName: string,
-  phase: 'started' | 'finished',
-  exitCode?: number
+  phase: "started" | "finished",
+  exitCode?: number,
 ): { summary: string; detail: string } {
   const category = describeCommandCategory(commandLine);
   const agentId = inferAgentForCommandLine(commandLine);
-  const emoji = agentId === 'builder' ? '🛠️' : agentId === 'reviewer' ? '🔎' : '🧭';
+  const emoji =
+    agentId === "builder" ? "🛠️" : agentId === "reviewer" ? "🔎" : "🧭";
 
   const actionLabel: Record<string, string> = {
-    'git-onderzoek': 'Git check',
-    'git-werkflow': 'Git actie',
-    dependencies: 'Dependencies',
-    build: 'Build',
-    'dev-server': 'Dev run',
-    checks: 'Checks',
-    formatting: 'Formatting',
-    terminal: 'Terminal commando'
+    "git-onderzoek": "Git check",
+    "git-werkflow": "Git actie",
+    dependencies: "Dependencies",
+    build: "Build",
+    "dev-server": "Dev run",
+    checks: "Checks",
+    formatting: "Formatting",
+    terminal: "Terminal commando",
   };
 
-  const label = actionLabel[category] || 'Terminal commando';
+  const label = actionLabel[category] || "Terminal commando";
 
-  if (phase === 'started') {
+  if (phase === "started") {
     return {
       summary: `${emoji} ${label} gestart`,
-      detail: `${terminalName} bereidt uitvoering voor\n${commandLine}`
+      detail: `${terminalName} bereidt uitvoering voor\n${commandLine}`,
     };
   }
 
-  if (typeof exitCode === 'number' && exitCode !== 0) {
+  if (typeof exitCode === "number" && exitCode !== 0) {
     return {
       summary: `${emoji} ${label} mislukt`,
-      detail: `${terminalName} stopte met exit ${exitCode}\n${commandLine}`
+      detail: `${terminalName} stopte met exit ${exitCode}\n${commandLine}`,
     };
   }
 
-  if (typeof exitCode === 'number') {
+  if (typeof exitCode === "number") {
     return {
       summary: `${emoji} ${label} afgerond`,
-      detail: `${terminalName} klaar met exit ${exitCode}\n${commandLine}`
+      detail: `${terminalName} klaar met exit ${exitCode}\n${commandLine}`,
     };
   }
 
   return {
     summary: `${emoji} ${label} afgerond`,
-    detail: `${terminalName} rondde af zonder exitcode\n${commandLine}`
+    detail: `${terminalName} rondde af zonder exitcode\n${commandLine}`,
   };
 }
 
 function inferAgentForTask(taskName: string): AgentId {
   const lower = taskName.toLowerCase();
   if (/lint|test|review|check|diagnostic|audit|typecheck/.test(lower)) {
-    return 'reviewer';
+    return "reviewer";
   }
-  if (/build|compile|bundle|fix|generate|pack|release|dev|serve|watch|start/.test(lower)) {
-    return 'builder';
+  if (
+    /build|compile|bundle|fix|generate|pack|release|dev|serve|watch|start/.test(
+      lower,
+    )
+  ) {
+    return "builder";
   }
   if (/scan|analy|readme|docs?|status|log|diff/.test(lower)) {
-    return 'scout';
+    return "scout";
   }
   return nextBalancedAgent();
 }
@@ -1269,43 +1709,54 @@ function inferAgentForTask(taskName: string): AgentId {
 function inferAgentForCommandLine(commandLine: string): AgentId {
   const lower = commandLine.toLowerCase();
   if (/\bgit\s+(status|log|diff|show|branch|blame)\b/.test(lower)) {
-    return 'scout';
+    return "scout";
   }
   if (/lint|eslint|test|review|diagnostic|check|audit|typecheck/.test(lower)) {
-    return 'reviewer';
+    return "reviewer";
   }
-  if (/\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(lower)) {
-    return 'builder';
+  if (
+    /\bgit\s+(add|commit|push|pull|merge|rebase|cherry-pick|stash)\b/.test(
+      lower,
+    )
+  ) {
+    return "builder";
   }
-  if (/build|compile|vite|npm run|pnpm|yarn|tsc|bundle|install|dev|serve|start|watch/.test(lower)) {
-    return 'builder';
+  if (
+    /build|compile|vite|npm run|pnpm|yarn|tsc|bundle|install|dev|serve|start|watch/.test(
+      lower,
+    )
+  ) {
+    return "builder";
   }
   return nextBalancedAgent();
 }
 
 function sanitizeCommandPreview(commandLine: string): string {
   if (!commandLine) {
-    return '(leeg commando)';
+    return "(leeg commando)";
   }
 
   const redacted = commandLine.replace(
     /\b(password|passwd|pwd|token|secret|api[_-]?key)\s*=\s*([^\s]+)/gi,
-    '$1=***'
+    "$1=***",
   );
 
-  return shorten(redacted.replace(/\s+/g, ' ').trim(), MAX_COMMAND_PREVIEW_LENGTH);
+  return shorten(
+    redacted.replace(/\s+/g, " ").trim(),
+    MAX_COMMAND_PREVIEW_LENGTH,
+  );
 }
 
 function createInitialRuntimeState(): RuntimeState {
   return {
     agents: {
-      scout: createAgentState('scout'),
-      builder: createAgentState('builder'),
-      reviewer: createAgentState('reviewer')
+      scout: createAgentState("scout"),
+      builder: createAgentState("builder"),
+      reviewer: createAgentState("reviewer"),
     },
     eventLog: [],
-    statusLine: 'IDLE',
-    git: createDefaultGitState()
+    statusLine: "IDLE",
+    git: createDefaultGitState(),
   };
 }
 
@@ -1313,30 +1764,36 @@ function createAgentState(id: AgentId): AgentViewState {
   return {
     id,
     label: AGENT_LABELS[id],
-    task: 'wacht in lounge',
-    status: 'idle',
+    task: "wacht in lounge",
+    status: "idle",
     progress: 0,
-    lastEventAt: Date.now()
+    lastEventAt: Date.now(),
   };
 }
 
-function scheduleAgentIdle(agentId: AgentId, timeoutMs: number = AGENT_INACTIVITY_IDLE_MS) {
+function scheduleAgentIdle(
+  agentId: AgentId,
+  timeoutMs: number = AGENT_INACTIVITY_IDLE_MS,
+) {
   const existing = idleTimers.get(agentId);
   if (existing) {
     clearTimeout(existing);
   }
 
-  const delayMs = Math.max(MIN_AGENT_IDLE_MS, Math.min(timeoutMs, AGENT_INACTIVITY_IDLE_MS));
+  const delayMs = Math.max(
+    MIN_AGENT_IDLE_MS,
+    Math.min(timeoutMs, AGENT_INACTIVITY_IDLE_MS),
+  );
 
   const timer = setTimeout(() => {
     emitRuntimeEvent({
-      type: 'agent.idleTimeout',
+      type: "agent.idleTimeout",
       timestamp: Date.now(),
       summary: `${AGENT_LABELS[agentId]} terug naar idle`,
       detail: `${Math.round(delayMs / 1000)}s geen nieuwe events ontvangen.`,
       agentId,
-      status: 'idle',
-      progress: 0
+      status: "idle",
+      progress: 0,
     });
   }, delayMs);
   idleTimers.set(agentId, timer);
@@ -1344,99 +1801,102 @@ function scheduleAgentIdle(agentId: AgentId, timeoutMs: number = AGENT_INACTIVIT
 
 function emitSyntheticTestEvents() {
   const runLabel = new Date().toLocaleTimeString();
-  const sequence: Array<{ delayMs: number; event: Omit<PixelRuntimeEvent, 'timestamp'> }> = [
+  const sequence: Array<{
+    delayMs: number;
+    event: Omit<PixelRuntimeEvent, "timestamp">;
+  }> = [
     {
       delayMs: 0,
       event: {
-        type: 'test.sequence.started',
-        summary: 'Test-sequence gestart',
+        type: "test.sequence.started",
+        summary: "Test-sequence gestart",
         detail: `Handmatige validatie run (${runLabel})`,
-        agentId: 'scout',
-        status: 'working',
-        progress: 10
-      }
+        agentId: "scout",
+        status: "working",
+        progress: 10,
+      },
     },
     {
       delayMs: TEST_EVENT_STEP_DELAY_MS,
       event: {
-        type: 'test.sequence.workspace',
-        summary: 'Workspace scan simulatie',
-        detail: 'Scannen van geopende files voor context.',
-        agentId: 'scout',
-        status: 'working',
-        progress: 45
-      }
+        type: "test.sequence.workspace",
+        summary: "Workspace scan simulatie",
+        detail: "Scannen van geopende files voor context.",
+        agentId: "scout",
+        status: "working",
+        progress: 45,
+      },
     },
     {
       delayMs: TEST_EVENT_STEP_DELAY_MS * 2,
       event: {
-        type: 'test.sequence.builder',
-        summary: 'Builder verwerkt wijziging',
-        detail: 'src/extension.ts',
-        filePath: 'src/extension.ts',
-        agentId: 'builder',
-        status: 'working',
-        progress: 58
-      }
+        type: "test.sequence.builder",
+        summary: "Builder verwerkt wijziging",
+        detail: "src/extension.ts",
+        filePath: "src/extension.ts",
+        agentId: "builder",
+        status: "working",
+        progress: 58,
+      },
     },
     {
       delayMs: TEST_EVENT_STEP_DELAY_MS * 3,
       event: {
-        type: 'test.sequence.reviewerWarning',
-        summary: 'Reviewer vond waarschuwing',
-        detail: '1 warning in test-run (gesimuleerd).',
-        agentId: 'reviewer',
-        status: 'error',
-        progress: 100
-      }
+        type: "test.sequence.reviewerWarning",
+        summary: "Reviewer vond waarschuwing",
+        detail: "1 warning in test-run (gesimuleerd).",
+        agentId: "reviewer",
+        status: "error",
+        progress: 100,
+      },
     },
     {
       delayMs: TEST_EVENT_STEP_DELAY_MS * 4,
       event: {
-        type: 'test.sequence.reviewerResolved',
-        summary: 'Reviewer waarschuwing opgelost',
-        detail: 'Geen warnings meer in gesimuleerde run.',
-        agentId: 'reviewer',
-        status: 'completed',
-        progress: 100
-      }
+        type: "test.sequence.reviewerResolved",
+        summary: "Reviewer waarschuwing opgelost",
+        detail: "Geen warnings meer in gesimuleerde run.",
+        agentId: "reviewer",
+        status: "completed",
+        progress: 100,
+      },
     },
     {
       delayMs: TEST_EVENT_STEP_DELAY_MS * 5,
       event: {
-        type: 'test.sequence.finished',
-        summary: 'Test-sequence afgerond',
-        detail: 'Panel event rendering werkt zoals verwacht (gesimuleerd).',
-        agentId: 'builder',
-        status: 'completed',
-        progress: 100
-      }
-    }
+        type: "test.sequence.finished",
+        summary: "Test-sequence afgerond",
+        detail: "Panel event rendering werkt zoals verwacht (gesimuleerd).",
+        agentId: "builder",
+        status: "completed",
+        progress: 100,
+      },
+    },
   ];
 
   for (const step of sequence) {
     setTimeout(() => {
       emitRuntimeEvent({
         ...step.event,
-        timestamp: Date.now()
+        timestamp: Date.now(),
       });
     }, step.delayMs);
   }
 
-  scheduleAgentIdle('scout');
-  scheduleAgentIdle('builder');
-  scheduleAgentIdle('reviewer');
+  scheduleAgentIdle("scout");
+  scheduleAgentIdle("builder");
+  scheduleAgentIdle("reviewer");
 }
 
 function emitRuntimeEvent(event: PixelRuntimeEvent) {
   const normalized: PixelRuntimeEvent = {
     ...event,
     timestamp: event.timestamp || Date.now(),
-    progress: normalizeProgress(event.progress)
+    progress: normalizeProgress(event.progress),
   };
 
   applyEventToRuntimeState(normalized);
-  queueOrSendMessage({ type: 'pixel.event', payload: normalized });
+  queueOrSendMessage({ type: "pixel.event", payload: normalized });
 }
 
 function applyEventToRuntimeState(event: PixelRuntimeEvent) {
@@ -1448,10 +1908,10 @@ function applyEventToRuntimeState(event: PixelRuntimeEvent) {
     const agent = runtimeState.agents[event.agentId];
     agent.lastEventAt = event.timestamp;
 
-    if (typeof event.status === 'string') {
+    if (typeof event.status === "string") {
       agent.status = event.status;
     }
-    if (typeof event.progress === 'number') {
+    if (typeof event.progress === "number") {
       agent.progress = event.progress;
     }
     if (event.detail) {
@@ -1476,24 +1936,24 @@ function buildStatusLine(agents: Record<AgentId, AgentViewState>): string {
 
   for (const agentId of Object.keys(agents) as AgentId[]) {
     const status = agents[agentId].status;
-    if (status === 'working') {
+    if (status === "working") {
       working += 1;
-    } else if (status === 'completed') {
+    } else if (status === "completed") {
       completed += 1;
-    } else if (status === 'error') {
+    } else if (status === "error") {
       errors += 1;
     }
   }
 
   if (working === 0 && completed === 0 && errors === 0) {
-    return 'IDLE';
+    return "IDLE";
   }
 
   return `${working} actief | ${completed} klaar | ${errors} fout`;
 }
 
 function normalizeProgress(progress: number | undefined): number | undefined {
-  if (typeof progress !== 'number' || Number.isNaN(progress)) {
+  if (typeof progress !== "number" || Number.isNaN(progress)) {
     return undefined;
   }
   return Math.max(0, Math.min(100, Math.round(progress)));
@@ -1515,121 +1975,133 @@ function openPixelPanel(context: vscode.ExtensionContext) {
     panelRef.reveal(vscode.ViewColumn.Beside);
 
     // Always refresh HTML on reveal so a stale retained webview cannot stay visually broken.
-    preferredPanelMode = 'auto';
+    preferredPanelMode = "auto";
     void renderPanelHtml(panelRef, context);
     armPanelReadyWatchdog(context);
 
     postSnapshot();
     emitRuntimeEvent({
-      type: 'panel.revealed',
+      type: "panel.revealed",
       timestamp: Date.now(),
-      summary: 'Pixel panel opnieuw zichtbaar',
-      detail: 'Bestaand panel hergebruikt.'
+      summary: "Pixel panel opnieuw zichtbaar",
+      detail: "Bestaand panel hergebruikt.",
     });
     return;
   }
 
   panelRef = vscode.window.createWebviewPanel(
     VIEW_TYPE,
-    'Pixel Agent',
+    "Pixel Agent",
     vscode.ViewColumn.Beside,
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview')]
-    }
+      localResourceRoots: [
+        vscode.Uri.joinPath(context.extensionUri, "dist", "webview"),
+      ],
+    },
   );
 
-  preferredPanelMode = 'auto';
+  preferredPanelMode = "auto";
   panelReady = false;
-  panelRef.iconPath = new vscode.ThemeIcon('symbol-color');
+  panelRef.iconPath = new vscode.ThemeIcon("symbol-color");
   void renderPanelHtml(panelRef, context);
   armPanelReadyWatchdog(context);
 
   panelRef.onDidDispose(() => {
     panelRef = undefined;
     panelReady = false;
-    preferredPanelMode = 'auto';
+    preferredPanelMode = "auto";
     queuedMessages = [];
     clearPanelReadyWatchdog();
   });
 
-  panelRef.webview.onDidReceiveMessage(async (message: WebviewToExtensionMessage) => {
-    if (!message || typeof message.type !== 'string') {
-      return;
-    }
-
-    if (message.type === 'webview-ready') {
-      panelReady = true;
-      clearPanelReadyWatchdog();
-      postSnapshot();
-      flushQueuedMessages();
-      emitRuntimeEvent({
-        type: 'panel.connected',
-        timestamp: Date.now(),
-        summary: 'Pixel panel verbonden',
-        detail: 'Webview ontvangt live events.'
-      });
-      return;
-    }
-
-    if (message.type === 'webview-request-snapshot') {
-      postSnapshot();
-      return;
-    }
-
-    if (message.type === 'retry-dev-server') {
-      preferredPanelMode = 'auto';
-      if (panelRef) {
-        await renderPanelHtml(panelRef, context);
-        armPanelReadyWatchdog(context);
+  panelRef.webview.onDidReceiveMessage(
+    async (message: WebviewToExtensionMessage) => {
+      if (!message || typeof message.type !== "string") {
+        return;
       }
-      return;
-    }
 
-    if (message.type === 'load-production') {
-      preferredPanelMode = 'production';
-      if (panelRef) {
-        await renderPanelHtml(panelRef, context);
-        armPanelReadyWatchdog(context);
+      if (message.type === "webview-ready") {
+        panelReady = true;
+        clearPanelReadyWatchdog();
+        postSnapshot();
+        flushQueuedMessages();
+        emitRuntimeEvent({
+          type: "panel.connected",
+          timestamp: Date.now(),
+          summary: "Pixel panel verbonden",
+          detail: "Webview ontvangt live events.",
+        });
+        return;
       }
-      return;
-    }
 
-    if (message.type === 'load-embedded') {
-      preferredPanelMode = 'embedded';
-      if (panelRef) {
-        await renderPanelHtml(panelRef, context);
-        armPanelReadyWatchdog(context);
+      if (message.type === "webview-request-snapshot") {
+        postSnapshot();
+        return;
       }
-    }
-  });
+
+      if (message.type === "retry-dev-server") {
+        preferredPanelMode = "auto";
+        if (panelRef) {
+          await renderPanelHtml(panelRef, context);
+          armPanelReadyWatchdog(context);
+        }
+        return;
+      }
+
+      if (message.type === "load-production") {
+        preferredPanelMode = "production";
+        if (panelRef) {
+          await renderPanelHtml(panelRef, context);
+          armPanelReadyWatchdog(context);
+        }
+        return;
+      }
+
+      if (message.type === "load-embedded") {
+        preferredPanelMode = "embedded";
+        if (panelRef) {
+          await renderPanelHtml(panelRef, context);
+          armPanelReadyWatchdog(context);
+        }
+      }
+    },
+  );
 
   emitRuntimeEvent({
-    type: 'panel.opened',
+    type: "panel.opened",
     timestamp: Date.now(),
-    summary: 'Pixel panel geopend',
-    detail: 'Wachten op webview connectie.'
+    summary: "Pixel panel geopend",
+    detail: "Wachten op webview connectie.",
   });
 }
 
-async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<void> {
+async function renderPanelHtml(
+  panel: vscode.WebviewPanel,
+  context: vscode.ExtensionContext,
+): Promise<void> {
   panelReady = false;
   clearPanelReadyWatchdog();
 
-  const devServerUrl = process.env.PIXEL_AGENT_WEBVIEW_DEV_SERVER_URL || DEFAULT_DEV_SERVER_URL;
+  const devServerUrl =
+    process.env.PIXEL_AGENT_WEBVIEW_DEV_SERVER_URL || DEFAULT_DEV_SERVER_URL;
   const inDevMode = context.extensionMode === vscode.ExtensionMode.Development;
 
-  if (preferredPanelMode === 'embedded') {
+  if (preferredPanelMode === "embedded") {
     await renderEmbeddedPanelHtml(panel, context.extensionUri);
     return;
   }
 
-  if (preferredPanelMode === 'production') {
+  if (preferredPanelMode === "production") {
     const hasBundle = await hasProductionBundle(context.extensionUri);
     panel.webview.html = hasBundle
       ? getProdWebviewHtml(panel.webview, context.extensionUri)
-      : getBundleMissingHtml(panel.webview, devServerUrl, 'Production bundle not found.');
+      : getBundleMissingHtml(
+          panel.webview,
+          devServerUrl,
+          "Production bundle not found.",
+        );
     return;
   }
 
@@ -1637,7 +2109,11 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
     const hasBundle = await hasProductionBundle(context.extensionUri);
     panel.webview.html = hasBundle
       ? getProdWebviewHtml(panel.webview, context.extensionUri)
-      : getBundleMissingHtml(panel.webview, devServerUrl, 'Run npm run build in this repository.');
+      : getBundleMissingHtml(
+          panel.webview,
+          devServerUrl,
+          "Run npm run build in this repository.",
+        );
     return;
   }
 
@@ -1653,10 +2129,18 @@ async function renderPanelHtml(panel: vscode.WebviewPanel, context: vscode.Exten
   }
 
   const hasBundle = await hasProductionBundle(context.extensionUri);
-  panel.webview.html = getDevServerFallbackHtml(panel.webview, devServerUrl, probe.reason, hasBundle);
+  panel.webview.html = getDevServerFallbackHtml(
+    panel.webview,
+    devServerUrl,
+    probe.reason,
+    hasBundle,
+  );
 }
 
-async function renderEmbeddedPanelHtml(panel: vscode.WebviewPanel, extensionUri: vscode.Uri): Promise<void> {
+async function renderEmbeddedPanelHtml(
+  panel: vscode.WebviewPanel,
+  extensionUri: vscode.Uri,
+): Promise<void> {
   const hasBundle = await hasProductionBundle(extensionUri);
   if (hasBundle) {
     panel.webview.html = getProdWebviewHtml(panel.webview, extensionUri);
@@ -1681,24 +2165,27 @@ function armPanelReadyWatchdog(context: vscode.ExtensionContext) {
       return;
     }
 
-    preferredPanelMode = 'embedded';
+    preferredPanelMode = "embedded";
     const panel = panelRef;
     void renderPanelHtml(panel, context).then(() => {
       emitRuntimeEvent({
-        type: 'panel.recovery',
+        type: "panel.recovery",
         timestamp: Date.now(),
-        summary: 'Panel recovery uitgevoerd',
-        detail: 'Geen webview-ready signaal ontvangen, embedded UI opnieuw geladen.',
-        agentId: 'builder',
-        status: 'working',
-        progress: 55
+        summary: "Panel recovery uitgevoerd",
+        detail:
+          "Geen webview-ready signaal ontvangen, embedded UI opnieuw geladen.",
+        agentId: "builder",
+        status: "working",
+        progress: 55,
       });
     });
   }, PANEL_READY_TIMEOUT_MS);
 }
 
-async function probeDevServer(devServerUrl: string): Promise<{ ok: boolean; reason: string }> {
-  const normalizedUrl = devServerUrl.replace(/\/$/, '');
+async function probeDevServer(
+  devServerUrl: string,
+): Promise<{ ok: boolean; reason: string }> {
+  const normalizedUrl = devServerUrl.replace(/\/$/, "");
   const clientUrl = `${normalizedUrl}/@vite/client`;
 
   const controller = new AbortController();
@@ -1708,28 +2195,40 @@ async function probeDevServer(devServerUrl: string): Promise<{ ok: boolean; reas
 
   try {
     const response = await fetch(clientUrl, {
-      method: 'GET',
-      signal: controller.signal
+      method: "GET",
+      signal: controller.signal,
     });
 
     if (!response.ok) {
       return { ok: false, reason: `HTTP ${response.status}` };
     }
 
-    return { ok: true, reason: '' };
+    return { ok: true, reason: "" };
   } catch (error) {
     if (error instanceof Error) {
       return { ok: false, reason: error.message };
     }
-    return { ok: false, reason: 'Unknown network error' };
+    return { ok: false, reason: "Unknown network error" };
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
 async function hasProductionBundle(extensionUri: vscode.Uri): Promise<boolean> {
-  const scriptUri = vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'main.js');
-  const styleUri = vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'style.css');
+  const scriptUri = vscode.Uri.joinPath(
+    extensionUri,
+    "dist",
+    "webview",
+    "assets",
+    "main.js",
+  );
+  const styleUri = vscode.Uri.joinPath(
+    extensionUri,
+    "dist",
+    "webview",
+    "assets",
+    "style.css",
+  );
 
   try {
     await vscode.workspace.fs.stat(scriptUri);
@@ -1740,8 +2239,11 @@ async function hasProductionBundle(extensionUri: vscode.Uri): Promise<boolean> {
   }
 }
 
-function getDevWebviewHtml(webview: vscode.Webview, devServerUrl: string): string {
-  const normalizedUrl = devServerUrl.replace(/\/$/, '');
+function getDevWebviewHtml(
+  webview: vscode.Webview,
+  devServerUrl: string,
+): string {
+  const normalizedUrl = devServerUrl.replace(/\/$/, "");
   const wsOrigin = toWebSocketOrigin(normalizedUrl);
   const nonce = getNonce();
 
@@ -1916,12 +2418,15 @@ function getDevWebviewHtml(webview: vscode.Webview, devServerUrl: string): strin
 </html>`;
 }
 
-function getProdWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+function getProdWebviewHtml(
+  webview: vscode.Webview,
+  extensionUri: vscode.Uri,
+): string {
   const scriptUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'main.js')
+    vscode.Uri.joinPath(extensionUri, "dist", "webview", "assets", "main.js"),
   );
   const styleUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'style.css')
+    vscode.Uri.joinPath(extensionUri, "dist", "webview", "assets", "style.css"),
   );
   const nonce = getNonce();
 
@@ -1948,14 +2453,14 @@ function getDevServerFallbackHtml(
   webview: vscode.Webview,
   devServerUrl: string,
   reason: string,
-  productionBundleAvailable: boolean
+  productionBundleAvailable: boolean,
 ): string {
   const nonce = getNonce();
   const safeUrl = escapeHtml(devServerUrl);
   const safeReason = escapeHtml(reason);
   const productionButton = productionBundleAvailable
     ? '<button id="load-production" class="secondary">Load Production Bundle</button>'
-    : '';
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -2031,7 +2536,7 @@ function getDevServerFallbackHtml(
       <p>Expected URL:</p>
       <code>${safeUrl}</code>
       <p>Reason:</p>
-      <code>${safeReason || 'Connection failed'}</code>
+      <code>${safeReason || "Connection failed"}</code>
       <p>Start it with:</p>
       <code>npm run dev:webview</code>
       <div class="actions">
@@ -2056,27 +2561,31 @@ function getDevServerFallbackHtml(
 </html>`;
 }
 
-function getBundleMissingHtml(webview: vscode.Webview, devServerUrl: string, reason: string): string {
+function getBundleMissingHtml(
+  webview: vscode.Webview,
+  devServerUrl: string,
+  reason: string,
+): string {
   return getDevServerFallbackHtml(webview, devServerUrl, reason, false);
 }
 
 function toWebSocketOrigin(url: string): string {
   try {
     const parsed = new URL(url);
-    const wsProtocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
     return `${wsProtocol}//${parsed.host}`;
   } catch {
-    return 'ws://127.0.0.1:5173';
+    return "ws://127.0.0.1:5173";
   }
 }
 
 function escapeHtml(value: string): string {
   return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 function queueOrSendMessage(message: ExtensionToWebviewMessage) {
@@ -2105,8 +2614,8 @@ function flushQueuedMessages() {
 
 function postSnapshot() {
   queueOrSendMessage({
-    type: 'pixel.snapshot',
-    payload: runtimeState
+    type: "pixel.snapshot",
+    payload: runtimeState,
   });
 }
 
@@ -2116,8 +2625,8 @@ function getWebviewHtml(webview: vscode.Webview): string {
     "default-src 'none'",
     `img-src ${webview.cspSource} data:`,
     "style-src 'unsafe-inline'",
-    `script-src 'nonce-${nonce}'`
-  ].join('; ');
+    `script-src 'nonce-${nonce}'`,
+  ].join("; ");
 
   return `<!doctype html>
 <html lang="en">
@@ -2617,7 +3126,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
 
     function setAgentSpeechText(agent, text, timestamp) {
       const when = typeof timestamp === 'number' ? timestamp : Date.now();
-      const normalized = shorten(String(text || '').replace(/\s+/g, ' ').trim(), 96);
+      const normalized = shorten(String(text || '').replace(/\\s+/g, ' ').trim(), 96);
       agent.speechText = normalized;
       agent.lastSpeechAt = when;
     }
@@ -2684,7 +3193,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function wrapWords(line, maxChars) {
-      const words = line.trim().split(/\s+/).filter(Boolean);
+      const words = line.trim().split(/\\s+/).filter(Boolean);
       if (words.length === 0) {
         return [];
       }
@@ -2719,7 +3228,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     function wrapBubbleText(text, maxChars, maxLines) {
       const parts = String(text || '')
         .split('\n')
-        .map((part) => part.replace(/\s+/g, ' ').trim())
+          .map((part) => part.replace(/\\s+/g, ' ').trim())
         .filter(Boolean);
 
       const lines = [];
@@ -2754,7 +3263,7 @@ function getWebviewHtml(webview: vscode.Webview): string {
     }
 
     function buildSpeechFromEvent(agent, event) {
-      const summary = event.summary ? shorten(String(event.summary).replace(/\s+/g, ' ').trim(), 74) : getActiveLine(agent);
+      const summary = event.summary ? shorten(String(event.summary).replace(/\\s+/g, ' ').trim(), 74) : getActiveLine(agent);
       const detail = event.detail ? shorten(String(event.detail).trim(), 90) : '';
       if (detail && detail !== summary) {
         return summary + '\n' + detail;
@@ -3277,8 +3786,9 @@ function getWebviewHtml(webview: vscode.Webview): string {
 }
 
 function getNonce(): string {
-  let text = '';
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let text = "";
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   for (let i = 0; i < 32; i += 1) {
     text += chars.charAt(Math.floor(Math.random() * chars.length));
   }

@@ -6,7 +6,7 @@
   "name": "pixel-copilot-agent",
   "displayName": "Pixel Copilot Agent",
   "description": "A starter extension with a pixel-style agent panel and Copilot Chat participant.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.99.0"

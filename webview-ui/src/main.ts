@@ -642,12 +642,11 @@ app.innerHTML = `
     <section class="card">
       <header class="title-row">
         <div>
-          <p class="kicker">Endfield Command Grid</p>
+          <p class="kicker">Pixel Agent Command Room</p>
           <h1>Anime-Tech Pixel Agent Ops</h1>
-          <p class="subtitle">Lichtere Endfield variant met wit-metaal basis en roze anime-tech agents.</p>
         </div>
         <div class="title-actions">
-          <span class="mode-chip">END-FIELD LITE</span>
+          <span class="mode-chip">PIXEL OPS</span>
           <button id="refresh-button" type="button">Sync Snapshot</button>
         </div>
       </header>

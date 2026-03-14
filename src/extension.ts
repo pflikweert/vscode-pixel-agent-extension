@@ -29,6 +29,8 @@ const CODEX_IMPORT_CONFIG_ROOT = "pixelAgent.codexImport";
 const DEFAULT_CODEX_IMPORT_POLL_MS = 1200;
 const MAX_CODEX_EVENT_FINGERPRINTS = 400;
 const CODEX_NATIVE_POLL_MS = 1000;
+const CODEX_NATIVE_HOME_RETRY_MS = 15_000;
+const CODEX_NATIVE_ROLLOUT_RESOLVE_RETRY_MS = 3_000;
 const CODEX_SESSION_INDEX = "session_index.jsonl";
 const CODEX_SESSIONS_DIR = "sessions";
 const CODEX_ARCHIVED_DIR = "archived_sessions";
@@ -224,6 +226,7 @@ interface CodexNativeRuntime {
   activeRolloutPath?: string;
   rolloutOffset: number;
   rolloutRemainder: string;
+  nextRolloutResolveAtMs: number;
   // dedup
   seenFingerprints: Set<string>;
   fingerprintQueue: string[];
@@ -1234,8 +1237,34 @@ function createCodexImportRuntime(
 
 // ── Auto-discovery of ~/.codex (Codex – OpenAI's coding agent) ──────────────
 
-function resolveCodexHome(): string {
-  return process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+function resolveCodexHomeCandidates(): string[] {
+  const candidates: string[] = [];
+  const envHome = process.env.CODEX_HOME?.trim();
+  const defaultHome = path.join(os.homedir(), ".codex");
+
+  if (envHome) {
+    candidates.push(envHome);
+  }
+  if (!candidates.includes(defaultHome)) {
+    candidates.push(defaultHome);
+  }
+
+  return candidates;
+}
+
+async function resolveExistingCodexHome(): Promise<string | undefined> {
+  const candidates = resolveCodexHomeCandidates();
+  for (const candidate of candidates) {
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isDirectory()) {
+        return candidate;
+      }
+    } catch {
+      // candidate ontbreekt of is niet leesbaar
+    }
+  }
+  return undefined;
 }
 
 function createCodexNativeRuntime(codexHome: string): CodexNativeRuntime {
@@ -1246,6 +1275,7 @@ function createCodexNativeRuntime(codexHome: string): CodexNativeRuntime {
     knownSessions: new Map(),
     rolloutOffset: 0,
     rolloutRemainder: "",
+    nextRolloutResolveAtMs: 0,
     seenFingerprints: new Set(),
     fingerprintQueue: [],
     busy: false,
@@ -1254,29 +1284,78 @@ function createCodexNativeRuntime(codexHome: string): CodexNativeRuntime {
 }
 
 function registerCodexNative(context: vscode.ExtensionContext) {
-  const codexHome = resolveCodexHome();
+  let runtime: CodexNativeRuntime | undefined;
+  let retryTimer: NodeJS.Timeout | undefined;
+  let waitingEmitted = false;
 
-  // Check if ~/.codex exists; if not, skip silently.
-  fs.stat(codexHome).then(
-    () => {
-      const rt = createCodexNativeRuntime(codexHome);
-      rt.poller = setInterval(() => {
-        void pollCodexNative(rt);
-      }, CODEX_NATIVE_POLL_MS);
-      void pollCodexNative(rt);
+  const start = async () => {
+    if (runtime) {
+      return;
+    }
 
-      context.subscriptions.push({
-        dispose: () => {
-          if (rt.poller) {
-            clearInterval(rt.poller);
-          }
-        },
-      });
+    const codexHome = await resolveExistingCodexHome();
+    if (!codexHome) {
+      if (!waitingEmitted) {
+        waitingEmitted = true;
+        emitRuntimeEvent({
+          type: "codex.nativeWaiting",
+          timestamp: Date.now(),
+          summary: "Codex auto-discovery wacht op ~/.codex",
+          detail: "Controleer CODEX_HOME of lokale Codex installatie.",
+          source: "codex",
+          agentId: "scout",
+          status: "working",
+          progress: 8,
+        });
+      }
+
+      if (!retryTimer) {
+        retryTimer = setInterval(() => {
+          void start();
+        }, CODEX_NATIVE_HOME_RETRY_MS);
+      }
+      return;
+    }
+
+    if (retryTimer) {
+      clearInterval(retryTimer);
+      retryTimer = undefined;
+    }
+
+    runtime = createCodexNativeRuntime(codexHome);
+    runtime.poller = setInterval(() => {
+      if (runtime) {
+        void pollCodexNative(runtime);
+      }
+    }, CODEX_NATIVE_POLL_MS);
+    void pollCodexNative(runtime);
+
+    emitRuntimeEvent({
+      type: "codex.nativeReady",
+      timestamp: Date.now(),
+      summary: "Codex auto-discovery actief",
+      detail: codexHome,
+      source: "codex",
+      agentId: "scout",
+      status: "working",
+      progress: 18,
+    });
+  };
+
+  void start();
+
+  context.subscriptions.push({
+    dispose: () => {
+      if (runtime?.poller) {
+        clearInterval(runtime.poller);
+      }
+      runtime = undefined;
+      if (retryTimer) {
+        clearInterval(retryTimer);
+      }
+      retryTimer = undefined;
     },
-    () => {
-      // codexHome not found — not installed, nothing to do
-    },
-  );
+  });
 }
 
 async function pollCodexNative(rt: CodexNativeRuntime): Promise<void> {
@@ -1309,6 +1388,7 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
       rt.indexOffset = 0;
       rt.indexRemainder = "";
     }
+    await ensureCodexActiveRollout(rt);
     return;
   }
 
@@ -1318,9 +1398,6 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
   const text = rt.indexRemainder + chunk;
   const lines = text.split("\n");
   rt.indexRemainder = lines.pop() ?? "";
-
-  let latestUpdatedMs = -1;
-  let latestEntry: CodexNativeSessionEntry | undefined;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -1346,12 +1423,6 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
     const prevMs = rt.knownSessions.get(entry.id) ?? -1;
     rt.knownSessions.set(entry.id, updatedMs);
 
-    // Track the most recently updated session across all lines
-    if (updatedMs > latestUpdatedMs) {
-      latestUpdatedMs = updatedMs;
-      latestEntry = entry;
-    }
-
     if (updatedMs > prevMs && entry.id !== rt.activeSessionId) {
       // Emit a session-started or session-updated event
       emitRuntimeEvent({
@@ -1367,15 +1438,51 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
     }
   }
 
-  // If the most recent session changed, start tracking its rollout
-  if (latestEntry && latestEntry.id !== rt.activeSessionId) {
-    const rolloutPath = await findCodexRolloutPath(rt.codexHome, latestEntry.id);
-    if (rolloutPath) {
-      rt.activeSessionId = latestEntry.id;
-      rt.activeRolloutPath = rolloutPath;
-      rt.rolloutOffset = 0;
-      rt.rolloutRemainder = "";
+  await ensureCodexActiveRollout(rt);
+}
+
+function getLatestCodexSessionId(rt: CodexNativeRuntime): string | undefined {
+  let latestSessionId: string | undefined;
+  let latestUpdatedMs = -1;
+  for (const [sessionId, updatedMs] of rt.knownSessions) {
+    if (updatedMs > latestUpdatedMs) {
+      latestUpdatedMs = updatedMs;
+      latestSessionId = sessionId;
     }
+  }
+  return latestSessionId;
+}
+
+async function ensureCodexActiveRollout(rt: CodexNativeRuntime): Promise<void> {
+  const now = Date.now();
+  if (rt.nextRolloutResolveAtMs > now) {
+    return;
+  }
+  rt.nextRolloutResolveAtMs = now + CODEX_NATIVE_ROLLOUT_RESOLVE_RETRY_MS;
+
+  const latestSessionId = getLatestCodexSessionId(rt);
+  if (!latestSessionId) {
+    return;
+  }
+
+  if (latestSessionId === rt.activeSessionId && rt.activeRolloutPath) {
+    return;
+  }
+
+  const rolloutPath = await findCodexRolloutPath(rt.codexHome, latestSessionId);
+  if (!rolloutPath) {
+    return;
+  }
+
+  if (
+    latestSessionId !== rt.activeSessionId ||
+    rolloutPath !== rt.activeRolloutPath
+  ) {
+    rt.activeSessionId = latestSessionId;
+    rt.activeRolloutPath = rolloutPath;
+    rt.rolloutOffset = 0;
+    rt.rolloutRemainder = "";
+    rt.nextRolloutResolveAtMs = 0;
   }
 }
 
@@ -1508,9 +1615,10 @@ async function readBytesAt(filePath: string, offset: number, length: number): Pr
 function codexRolloutLineToEvent(
   record: Record<string, unknown>,
 ): PixelRuntimeEvent | undefined {
-  const ts = typeof record.timestamp === "string"
+  const parsedTs = typeof record.timestamp === "string"
     ? new Date(record.timestamp as string).getTime()
     : Date.now();
+  const ts = Number.isFinite(parsedTs) ? parsedTs : Date.now();
   const type = typeof record.type === "string" ? (record.type as string) : "";
   const payload = (record.payload ?? {}) as Record<string, unknown>;
 
@@ -1701,6 +1809,56 @@ function codexRolloutLineToEvent(
         progress: 100,
         source: "codex",
       };
+    }
+
+    case "event_msg": {
+      const eventType =
+        typeof payload.type === "string" ? payload.type.toLowerCase() : "";
+
+      if (eventType === "agent_message") {
+        const text =
+          typeof payload.message === "string" ? payload.message.trim() : "";
+        if (!text) {
+          return undefined;
+        }
+        return {
+          type: "codex.agentMessage",
+          timestamp: ts,
+          summary: shorten(text, 80),
+          detail: shorten(text, 240),
+          agentId: inferAgentFromText(text),
+          status: "working",
+          progress: 38,
+          source: "codex",
+        };
+      }
+
+      if (eventType === "task_started") {
+        return {
+          type: "codex.taskStarted",
+          timestamp: ts,
+          summary: "Codex taak gestart",
+          detail: "Nieuwe Codex-run actief",
+          agentId: "scout",
+          status: "working",
+          progress: 12,
+          source: "codex",
+        };
+      }
+
+      if (eventType === "task_complete") {
+        return {
+          type: "codex.complete",
+          timestamp: ts,
+          summary: "Codex taak afgerond",
+          agentId: "reviewer",
+          status: "completed",
+          progress: 100,
+          source: "codex",
+        };
+      }
+
+      return undefined;
     }
 
     default:

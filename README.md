@@ -190,6 +190,7 @@ Gedrag:
 - zoekt eerst `CODEX_HOME`, en valt anders terug op `~/.codex`
 - pollt `session_index.jsonl` voor nieuwe of bijgewerkte sessies
 - zoekt de actieve rollout in `sessions/` of `archived_sessions/`
+- toont alleen native Codex sessies waarvan de `cwd` binnen de huidige VS Code workspace valt
 - vertaalt native Codex records naar Pixel runtime events met source `codex`
 - koppelt Codex standaard aan de `Builder` agent, zodat coding-agent activiteit direct zichtbaar is in de scene
 
@@ -296,6 +297,13 @@ Belangrijkste velden per runtime event:
 - In scope: events van de eigen @pixel participant via publieke API
 - Best effort: publieke workspace/task/diagnostics signalen
 - Niet beschikbaar: interne built-in Copilot agent-events zonder publieke extensie-API
+
+## Workspace isolatie
+
+- iedere VS Code window draait zijn eigen Pixel Agent runtime en eventlog
+- workspace-, task-, terminal-, diagnostics- en git-events komen alleen uit de huidige IDE/workspace
+- native Codex auto-discovery wordt gefilterd op sessies waarvan de `cwd` binnen de huidige workspace valt
+- handmatige Codex import gebruikt workspace-context zoals `cwd`, `workspaceRoot`, `repositoryRoot` of absolute `filePath`/`path` wanneer die in records aanwezig is
 
 ## Ontwikkelflow
 

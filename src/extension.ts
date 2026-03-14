@@ -214,13 +214,23 @@ interface CodexNativeSessionEntry {
   updated_at: string;
 }
 
+interface CodexNativeSessionState {
+  id: string;
+  threadName: string;
+  updatedAtMs: number;
+  rolloutPath?: string;
+  cwd?: string;
+  matchesWorkspace?: boolean;
+  metadataLoaded: boolean;
+}
+
 interface CodexNativeRuntime {
   codexHome: string;
   // session_index.jsonl polling state
   indexOffset: number;
   indexRemainder: string;
-  // known sessions: id → updated_at ms
-  knownSessions: Map<string, number>;
+  // known sessions: id → metadata
+  knownSessions: Map<string, CodexNativeSessionState>;
   // currently tracked rollout
   activeSessionId?: string;
   activeRolloutPath?: string;
@@ -1011,6 +1021,108 @@ function getWorkspaceSummary(): string {
   return `folders: ${names}`;
 }
 
+function getWorkspaceRootPaths(): string[] {
+  return (vscode.workspace.workspaceFolders ?? [])
+    .map((folder) => path.resolve(folder.uri.fsPath))
+    .filter((folderPath, index, all) => all.indexOf(folderPath) === index);
+}
+
+function isPathInsideCurrentWorkspace(targetPath: string | undefined): boolean {
+  if (!targetPath) {
+    return false;
+  }
+
+  const resolvedTarget = path.resolve(targetPath);
+  return getWorkspaceRootPaths().some((rootPath) => {
+    if (resolvedTarget === rootPath) {
+      return true;
+    }
+    return resolvedTarget.startsWith(`${rootPath}${path.sep}`);
+  });
+}
+
+function recordHasExplicitWorkspaceContext(record: Record<string, unknown>): boolean {
+  const nestedContext =
+    record.context && typeof record.context === "object"
+      ? (record.context as Record<string, unknown>)
+      : undefined;
+
+  return Boolean(
+    readStringProperty(
+      record,
+      "cwd",
+      "workspaceRoot",
+      "workspacePath",
+      "repositoryRoot",
+      "root",
+      "workspace",
+      "projectRoot",
+    ) ||
+      readStringProperty(record, "filePath", "path", "file") ||
+      readStringProperty(
+        nestedContext ?? {},
+        "cwd",
+        "workspaceRoot",
+        "workspacePath",
+        "repositoryRoot",
+        "root",
+        "workspace",
+        "projectRoot",
+        "filePath",
+        "path",
+        "file",
+      ),
+  );
+}
+
+function isCodexRecordRelevantToCurrentWorkspace(
+  record: Record<string, unknown>,
+): boolean {
+  const nestedContext =
+    record.context && typeof record.context === "object"
+      ? (record.context as Record<string, unknown>)
+      : undefined;
+  const absoluteCandidates = [
+    readStringProperty(
+      record,
+      "cwd",
+      "workspaceRoot",
+      "workspacePath",
+      "repositoryRoot",
+      "root",
+      "workspace",
+      "projectRoot",
+      "filePath",
+      "path",
+      "file",
+    ),
+    readStringProperty(
+      nestedContext ?? {},
+      "cwd",
+      "workspaceRoot",
+      "workspacePath",
+      "repositoryRoot",
+      "root",
+      "workspace",
+      "projectRoot",
+      "filePath",
+      "path",
+      "file",
+    ),
+  ].filter(
+    (value): value is string =>
+      typeof value === "string" && path.isAbsolute(value),
+  );
+
+  if (absoluteCandidates.length === 0) {
+    return !recordHasExplicitWorkspaceContext(record);
+  }
+
+  return absoluteCandidates.some((candidate) =>
+    isPathInsideCurrentWorkspace(candidate),
+  );
+}
+
 function getActiveSelectionPreview(): string | undefined {
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
@@ -1420,16 +1532,32 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
       continue;
     }
 
-    const prevMs = rt.knownSessions.get(entry.id) ?? -1;
-    rt.knownSessions.set(entry.id, updatedMs);
+    const previous = rt.knownSessions.get(entry.id);
+    const nextSession: CodexNativeSessionState = {
+      id: entry.id,
+      threadName: entry.thread_name || previous?.threadName || "",
+      updatedAtMs: updatedMs,
+      rolloutPath: previous?.rolloutPath,
+      cwd: previous?.cwd,
+      matchesWorkspace: previous?.matchesWorkspace,
+      metadataLoaded: previous?.metadataLoaded ?? false,
+    };
+    rt.knownSessions.set(entry.id, nextSession);
 
-    if (updatedMs > prevMs && entry.id !== rt.activeSessionId) {
-      // Emit a session-started or session-updated event
+    await ensureCodexSessionMetadata(rt, nextSession);
+
+    const prevMs = previous?.updatedAtMs ?? -1;
+    if (
+      updatedMs > prevMs &&
+      nextSession.matchesWorkspace &&
+      entry.id !== rt.activeSessionId
+    ) {
       emitRuntimeEvent({
         type: "codex.session",
         timestamp: updatedMs,
-        summary: entry.thread_name || `Codex sessie ${entry.id.slice(0, 8)}`,
-        detail: `Codex: ${entry.thread_name || entry.id}`,
+        summary:
+          nextSession.threadName || `Codex sessie ${nextSession.id.slice(0, 8)}`,
+        detail: `Codex: ${nextSession.threadName || nextSession.id}`,
         agentId: "scout",
         status: "working",
         progress: 0,
@@ -1444,9 +1572,12 @@ async function pollCodexSessionIndex(rt: CodexNativeRuntime): Promise<void> {
 function getLatestCodexSessionId(rt: CodexNativeRuntime): string | undefined {
   let latestSessionId: string | undefined;
   let latestUpdatedMs = -1;
-  for (const [sessionId, updatedMs] of rt.knownSessions) {
-    if (updatedMs > latestUpdatedMs) {
-      latestUpdatedMs = updatedMs;
+  for (const [sessionId, session] of rt.knownSessions) {
+    if (!session.matchesWorkspace) {
+      continue;
+    }
+    if (session.updatedAtMs > latestUpdatedMs) {
+      latestUpdatedMs = session.updatedAtMs;
       latestSessionId = sessionId;
     }
   }
@@ -1459,6 +1590,12 @@ async function ensureCodexActiveRollout(rt: CodexNativeRuntime): Promise<void> {
     return;
   }
   rt.nextRolloutResolveAtMs = now + CODEX_NATIVE_ROLLOUT_RESOLVE_RETRY_MS;
+
+  for (const session of rt.knownSessions.values()) {
+    if (!session.metadataLoaded) {
+      await ensureCodexSessionMetadata(rt, session);
+    }
+  }
 
   const latestSessionId = getLatestCodexSessionId(rt);
   if (!latestSessionId) {
@@ -1546,6 +1683,71 @@ async function findCodexRolloutPath(
   }
 
   return undefined;
+}
+
+async function readCodexSessionCwd(
+  rolloutPath: string,
+): Promise<string | undefined> {
+  let text = "";
+  try {
+    const stat = await fs.stat(rolloutPath);
+    const bytesToRead = Math.min(stat.size, 64 * 1024);
+    text = await readBytesAt(rolloutPath, 0, bytesToRead);
+  } catch {
+    return undefined;
+  }
+
+  const lines = text.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    if (record.type !== "session_meta") {
+      continue;
+    }
+
+    const payload =
+      record.payload && typeof record.payload === "object"
+        ? (record.payload as Record<string, unknown>)
+        : undefined;
+    const cwd = payload && typeof payload.cwd === "string" ? payload.cwd : "";
+    return cwd || undefined;
+  }
+
+  return undefined;
+}
+
+async function ensureCodexSessionMetadata(
+  rt: CodexNativeRuntime,
+  session: CodexNativeSessionState,
+): Promise<void> {
+  if (session.metadataLoaded && session.rolloutPath) {
+    return;
+  }
+
+  const rolloutPath =
+    session.rolloutPath ?? (await findCodexRolloutPath(rt.codexHome, session.id));
+  session.rolloutPath = rolloutPath;
+  if (!rolloutPath) {
+    return;
+  }
+
+  if (!session.metadataLoaded) {
+    session.cwd = await readCodexSessionCwd(rolloutPath);
+    if (session.cwd) {
+      session.matchesWorkspace = isPathInsideCurrentWorkspace(session.cwd);
+      session.metadataLoaded = true;
+    }
+  }
 }
 
 async function pollCodexActiveRollout(rt: CodexNativeRuntime): Promise<void> {
@@ -2471,6 +2673,9 @@ function codexRecordToRuntimeEvent(record: unknown): PixelRuntimeEvent | undefin
   }
 
   const typed = record as Record<string, unknown>;
+  if (!isCodexRecordRelevantToCurrentWorkspace(typed)) {
+    return undefined;
+  }
   const normalizedType = normalizeImportedType(
     readStringProperty(typed, "type", "event", "kind") || "event",
   );
